@@ -1,0 +1,170 @@
+#! /usr/bin/perl
+
+# lm-get-configs
+# 
+# This script uses the LogicMonitor REST API to dump all device configuration files for
+# local archiving, searching and reporting purposes.
+
+#------------------------------------------------------------------------------
+# Copyright (c) 2018 by Willing Minds LLC
+# All Rights Reserved.
+#
+# 1240 N. Van Buren Street #107
+# Anaheim, CA 92807
+#
+# 714-630-4772 (voice)
+# 714-844-4698 (fax)
+#
+# http://www.willingminds.com/
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#------------------------------------------------------------------------------
+
+
+use FindBin qw($Script $Bin);
+use LWP 5.8;
+use Getopt::Long;
+use Data::Dumper;
+use Text::CSV_XS;
+use Time::HiRes qw(time);
+use IO::File;
+
+use lib "$Bin";
+use WM::LMAPI;
+
+use strict;
+use warnings;
+
+#------------------------------------------------------------------------------
+
+# option defaults
+my $DRYRUN = 0;
+my $VERBOSE = 0;
+my $COMPANY;
+
+Getopt::Long::Configure ("bundling");
+
+GetOptions(
+    "dryrun|n"		=> \$DRYRUN,
+    "verbose|v+"	=> \$VERBOSE,
+    "company|c=s"	=> \$COMPANY,
+) or die;
+
+die "ERROR: must define company\n" if not defined($COMPANY);
+
+if ($DRYRUN) {
+    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
+}
+
+sub verbose ($@) {
+    my $minverbose = shift;
+    print join("", @_) if $VERBOSE >= $minverbose;
+}
+
+my $lmapi = WM::LMAPI->new(company => $COMPANY) or die;
+
+my %table;
+my %columns;
+
+my $query_total = 0;
+my $query_cs = 0;
+
+my $devices  = $lmapi->get_all(path => "/device/devices", fields => "id,systemProperties,displayName");
+DEVICE:
+for my $device (@$devices) {
+    my $query_start = time;
+    my $devicedatasources  = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources", filter=>"dataSourceType:CS", fields => "id,dataSourceName");
+    my $query_end = time;
+    $query_total += ($query_end - $query_start);
+    if (@$devicedatasources) {
+	# determine client name (must be defined in wm.client custom property -- LM has no actual multitenancy support)
+	my $properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
+	if (my $client = getprop($properties, 'wm.client')) {
+	    # validate input string
+	    if ($client !~ /^\w+$/) {
+		warn "ERROR: $client: $device->{displayName}: invalid value for wm.client\n";
+		next DEVICE;
+	    }
+
+	    # ensure target directory exists
+	    my $dirname = "lmconfig-$client";
+	    if (not -d $dirname) {
+		if (not mkdir($dirname)) {
+		    warn "ERROR: $dirname: unable to create directory: $!\n";
+		    next DEVICE;
+		}
+	    }
+
+	    # copy LMConfig data for this device
+	    for my $devicedatasource (@$devicedatasources) {
+		$query_cs++;
+
+		# dump metadata
+		if (length $devicedatasource->{dataSourceName}) {
+		    my $label = "$device->{displayName}.dataSourceName";
+		    if (my $fh = IO::File->new(">$dirname/$label")) {
+			print $fh $devicedatasource->{dataSourceName}, "\n";
+		    }
+		    else {
+			warn "ERROR: $dirname/$label: $!\n";
+		    }
+		}
+
+		# dump configuration instances
+		my $instances = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances");
+		for my $instance (@$instances) {
+		    if (defined $instance->{id}) {
+			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
+			for my $c (@$config) {
+			    my $label = "$c->{deviceDisplayName}.$c->{instanceName}";
+			    verbose 2, "label=$label\n";
+			    if ($label =~ /^[\w._-]+$/) {
+				if (length $c->{config} > 0) {
+				    if (my $fh = IO::File->new(">$dirname/$label")) {
+					print $fh $c->{config}, "\n";
+				    }
+				    else {
+					warn "ERROR: $dirname/$label: $!\n";
+				    }
+				}
+				else {
+				    warn "ERROR: $label: skipped due to low or no data returned\n";
+				}
+			    }
+			    verbose 3, Dumper([sort keys %$c]);
+			}
+		    }
+		}
+	    }
+	}
+	else {
+	    warn "ERROR: $device->{displayName}: wm.client property undefined\n";
+	    next DEVICE;
+	}
+    }
+}
+verbose 1, sprintf("%s: queried %d devices for %d ConfigSources in %.1f seconds\n", $COMPANY, scalar @{$devices}, $query_cs, $query_total);
+
+exit;
+
+sub getprop {
+    my $properties = shift;
+    my $name = shift;
+
+    my $pval = (map { $_->{value} } grep { $_->{name} eq $name } @{$properties})[0];
+
+    return $pval;
+}
