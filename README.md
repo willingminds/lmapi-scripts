@@ -1,7 +1,7 @@
 # lmapi-scripts
 
 * WM/LMAPI.pm
- * simple API wrapper to deal with LM machinery, like JSON and rate-limiting.  Expects API credentials in a YAML file in ~/.lmapi formatted as:
+  * simple API wrapper to deal with LM machinery, like JSON and rate-limiting.  Expects API credentials in a YAML file in ~/.lmapi formatted as:
 
  ```yaml
  ---
