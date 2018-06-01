@@ -15,8 +15,7 @@
  ```
 
 * lm-get-configs
- * collect ConfigSource files from all devices within a portal
+  * collect ConfigSource files from all devices within a portal
 
 * run-lm-get-configs
- * wrapper for lm-get-configs, uses git after refresh to update repository
-
+  * wrapper for lm-get-configs, uses git after refresh to update repository
