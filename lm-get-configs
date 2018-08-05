@@ -113,10 +113,11 @@ for my $device (@$devices) {
 		$query_cs++;
 
 		# dump metadata
-		if (length $devicedatasource->{dataSourceName}) {
+		my $configSourceName = $devicedatasource->{dataSourceName};
+		if (length $configSourceName) {
 		    my $label = "$device->{displayName}.dataSourceName";
 		    if (my $fh = IO::File->new(">$dirname/$label")) {
-			print $fh $devicedatasource->{dataSourceName}, "\n";
+			print $fh "$configSourceName\n";
 		    }
 		    else {
 			warn "ERROR: $dirname/$label: $!\n";
@@ -130,21 +131,39 @@ for my $device (@$devices) {
 			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
 			for my $c (@$config) {
 			    my $label = "$c->{deviceDisplayName}.$c->{instanceName}";
+			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
 			    verbose 2, "label=$label\n";
 			    if ($label =~ /^[\w._-]+$/) {
-				if (length $c->{config} > 0) {
+				# preprocess results since LM cannot seem to program properly
+				$c->{config} =~ s/^\s*//s;
+				$c->{config} =~ s/\s*$//s;
+				if ($configSourceName eq "Cisco_IOS") {
+				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
+				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
+				}
+
+				if ($c->{config} =~ /^\s*$/s) {
+				    warn "ERROR: $dirname/$label: empty result, skipping\n";
+				}
+				elsif ($c->{config} =~ /^false$/) {
+				    warn "ERROR: $dirname/$label: bogus 'false' result, skipping\n";
+				}
+				elsif ($c->{config} =~ /^(%Error.*)$/m) {
+				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				}
+				else {
 				    if (my $fh = IO::File->new(">$dirname/$label")) {
 					print $fh $c->{config}, "\n";
 				    }
 				    else {
-					warn "ERROR: $dirname/$label: $!\n";
+					warn "ERROR: open $dirname/$label: $!\n";
 				    }
 				}
-				else {
-				    warn "ERROR: $label: skipped due to low or no data returned\n";
-				}
+				verbose 3, Dumper([sort keys %$c]);
 			    }
-			    verbose 3, Dumper([sort keys %$c]);
+			    else {
+				warn "ERROR: $dirname/$label: invalid label format, skipping\n";
+			    }
 			}
 		    }
 		}

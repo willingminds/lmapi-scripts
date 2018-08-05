@@ -10,14 +10,19 @@ for portal in $PORTALS; do
     cd $BASE/lmconfig/$portal || exit 1
     $BASE/lmapi-scripts/lm-get-configs --company $portal "$@"
     for repo in *; do
-	if [ "$repo" = "*" ]; then
+	if [ "$repo" != "*" ]; then
 	    (cd $repo || exit 1;
-	     git add *;
-	     git diff --exit-code --staged > /dev/null; 
-	     if [ $? -ne 0 ]; then
-		 git commit -q -a -m "lm-get-configs:$repo" >/dev/null
-		 git push -q >/dev/null
-	     fi
+	     if [ "$(echo *)" != "*" ]; then
+		 git add *;
+		 git diff --exit-code --staged > /dev/null; 
+		 new_files=$?
+		 git diff --exit-code > /dev/null; 
+		 changed_files=$?
+		 if [ $new_files -ne 0 -o $changed_files -ne 0 ]; then
+		     git commit -q -a -m "lm-get-configs:$repo" >/dev/null
+		     git push -q >/dev/null
+		 fi
+	      fi
 	    )
 	fi
     done
