@@ -79,6 +79,7 @@ sub initialize {
     $self->{access_key} = $lmapi_base->{access_key};
     $self->{company} = $company;
     $self->{baseurl} = "https://${company}.logicmonitor.com/santaba/rest";
+    $self->{referbase} = "https://${company}.logicmonitor.com/santaba/uiv3";
 }
 
 sub get_all {
@@ -120,6 +121,9 @@ sub get_all {
 		croak "get_all: $json->{status} $json->{errmsg}\n";
 	    }
 	}
+	else {
+	    last;
+	}
     }
 
     return $items;
@@ -144,8 +148,14 @@ sub _get {
     my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
+    my $pathroot = $path;
+    $pathroot =~ s:(/[^/]+)/.*:$1:;
+    my $referer = $self->{referbase} . $pathroot . '/index.jsp';
     while (1) {
-	my $req = GET $url, 'Authorization' => $auth, 'Content-Type' => 'application/json', 'Accept' => 'application/json';
+	my $req = GET $url, 'Referer' => $referer,
+			    'Authorization' => $auth,
+			    'Content-Type' => 'application/json',
+			    'Accept' => 'application/json';
 	if (my $response = $ua->request( $req )) {
 	    if ($response->is_success) {
 		return from_json($response->content);
@@ -157,7 +167,10 @@ sub _get {
 		}
 	    }
 	    else {
-		carp "Response Status: ", $response->status_line. "\n";
+		carp "Problem with request:\n", 
+		     "    Request: $url\n", 
+		     "    Referer: $referer\n", 
+		     "    Response Status: ", $response->status_line . "\n";
 		return undef;
 	    }
 	}
@@ -185,6 +198,30 @@ sub put {
     }
 }
 
+sub post {
+    my $self = shift;
+    my %opts = @_;
+
+    my $path = $opts{'path'};
+    my $content = $opts{'content'};
+
+    # construct authorization string
+    my $auth = $self->lmapiauth(method => 'POST', %opts);
+
+    # setup HTTP agent and headers
+    my $ua = LWP::UserAgent->new();
+    my $url = $self->{baseurl} . $path;
+    my $req = POST $url, 'Authorization' => $auth, 'Content-Type' => 'application/json', 'Content' => $content;
+    if (my $response = $ua->request( $req )) {
+	if ($response->is_success) {
+	    return from_json($response->content);
+	}
+	else {
+	    carp "Response Status: ", $response->status_line. "\n";
+	}
+    }
+}
+
 sub lmapiauth {
     my $self = shift;
     my %opts = @_;
@@ -193,7 +230,7 @@ sub lmapiauth {
     my $method = $opts{'method'};
     my $content = "";
 
-    $content = $opts{'content'} if $method eq "PUT";
+    $content = $opts{'content'} if ($method eq "PUT" or $method eq "POST");
     
     # construct authorization string
     my $epoch = int(time * 1000);	# time in ms

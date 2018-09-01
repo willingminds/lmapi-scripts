@@ -126,6 +126,7 @@ for my $device (@$devices) {
 
 		# dump configuration instances
 		my $instances = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances");
+		INSTANCE:
 		for my $instance (@$instances) {
 		    if (defined $instance->{id}) {
 			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
@@ -140,6 +141,10 @@ for my $device (@$devices) {
 				if ($configSourceName eq "Cisco_IOS") {
 				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
+				    if ($c->{config} =~ /^line con ([1-9].*)/m) {
+					warn "ERROR: $dirname/$label: bogus 'line con $1' in config due to LM bugs, skipping\n";
+					next INSTANCE;
+				    }
 				}
 
 				if ($c->{config} =~ /^\s*$/s) {
