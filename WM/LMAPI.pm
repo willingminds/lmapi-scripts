@@ -100,15 +100,23 @@ sub get_all {
 		    if (ref $json->{data}->{items} eq 'ARRAY' and @{$json->{data}->{items}}) {
 			push(@$items, @{$json->{data}->{items}});
 		    }
+		    elsif (ref $json->{data}->{items} eq 'HASH') {
+			push(@$items, $json->{data}->{items});
+		    }
 		    else {
 			last;	# no more items
 		    }
 		}
-		else {
-		    if (ref $json->{data} eq 'HASH') {
-			push(@$items, $json->{data});
+		elsif (exists $json->{items}) {
+		    if (ref $json->{items} eq 'ARRAY' and @{$json->{items}}) {
+			push(@$items, @{$json->{items}});
 		    }
-		    last;
+		    elsif (ref $json->{items} eq 'HASH') {
+			push(@$items, $json->{items});
+		    }
+		    else {
+			last;	# no more items
+		    }
 		}
 		if (defined($maxitems)) {
 		    if (($maxitems -= $fetchsize) <= 0) {
@@ -137,6 +145,20 @@ sub _get {
 
     my $path = $opts{'path'};
 
+    # extract explicit version, or set version implicitly for specific paths
+    my $version = $opts{'version'};
+    if (defined($version) and length($version)) {
+	$version = int($version);
+    }
+    else {
+	if ($path =~ m:^(/setting/netscans/|/device/devices/\d+/flows|/setting/alert/internalalerts):) {
+	    $version = 2;
+	}
+	else {
+	    $version = 1;
+	}
+    }
+
     for my $prop (qw(size sort filter fields offset format period datapoints)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
     }
@@ -148,17 +170,21 @@ sub _get {
     my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
-    my $pathroot = $path;
-    $pathroot =~ s:(/[^/]+)/.*:$1:;
-    my $referer = $self->{referbase} . $pathroot . '/index.jsp';
+    my @headers = (
+	'Authorization' => $auth,
+	'Content-Type' => 'application/json',
+	'Accept' => 'application/json',
+    );
+    if ($version > 1) {
+	push(@headers, "X-version" => "$version");
+    }
     while (1) {
-	my $req = GET $url, 'Referer' => $referer,
-			    'Authorization' => $auth,
-			    'Content-Type' => 'application/json',
-			    'Accept' => 'application/json';
+	my $req = GET $url, @headers;
 	if (my $response = $ua->request( $req )) {
 	    if ($response->is_success) {
-		return from_json($response->content);
+		my $hash = from_json($response->content);
+		$hash->{status} = $response->code unless defined $hash->{status};
+		return $hash;
 	    }
 	    elsif ($response->status_line =~ /^429\s/ and $response->header('X-Rate-Limit-Remaining') == 0) {
 		my $window = $response->header('X-Rate-Limit-Window');
@@ -169,7 +195,6 @@ sub _get {
 	    else {
 		carp "Problem with request:\n", 
 		     "    Request: $url\n", 
-		     "    Referer: $referer\n", 
 		     "    Response Status: ", $response->status_line . "\n";
 		return undef;
 	    }
