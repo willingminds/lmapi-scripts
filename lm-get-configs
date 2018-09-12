@@ -54,6 +54,7 @@ use warnings;
 my $DRYRUN = 0;
 my $VERBOSE = 0;
 my $COMPANY;
+my $MYCLIENT = 'wm.client'; # determine client name (must be defined in LM as a custom property -- LM has no actual multitenancy support)
 
 Getopt::Long::Configure ("bundling");
 
@@ -61,6 +62,7 @@ GetOptions(
     "dryrun|n"		=> \$DRYRUN,
     "verbose|v+"	=> \$VERBOSE,
     "company|c=s"	=> \$COMPANY,
+	"myclient|m=s"	=> \$MYCLIENT,
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
@@ -90,12 +92,11 @@ for my $device (@$devices) {
     my $query_end = time;
     $query_total += ($query_end - $query_start);
     if (@$devicedatasources) {
-	# determine client name (must be defined in wm.client custom property -- LM has no actual multitenancy support)
 	my $properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
-	if (my $client = getprop($properties, 'wm.client')) {
+	if (my $client = getprop($properties, $MYCLIENT)) {
 	    # validate input string
 	    if ($client !~ /^\w+$/) {
-		warn "ERROR: $client: $device->{displayName}: invalid value for wm.client\n";
+		warn "ERROR: $client: $device->{displayName}: invalid value for $MYCLIENT\n";
 		next DEVICE;
 	    }
 
@@ -175,7 +176,7 @@ for my $device (@$devices) {
 	    }
 	}
 	else {
-	    warn "ERROR: $device->{displayName}: wm.client property undefined\n";
+	    warn "ERROR: $device->{displayName}: $MYCLIENT property undefined\n";
 	    next DEVICE;
 	}
     }
