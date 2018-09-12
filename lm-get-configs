@@ -62,7 +62,7 @@ GetOptions(
     "dryrun|n"		=> \$DRYRUN,
     "verbose|v+"	=> \$VERBOSE,
     "company|c=s"	=> \$COMPANY,
-	"myclient|m=s"	=> \$MYCLIENT,
+    "myclient|m=s"	=> \$MYCLIENT,
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
