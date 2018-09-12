@@ -96,7 +96,7 @@ for my $device (@$devices) {
 	if (my $client = getprop($properties, $MYCLIENT)) {
 	    # validate input string
 	    if ($client !~ /^\w+$/) {
-		warn "ERROR: $client: $device->{displayName}: invalid value for $MYCLIENT\n";
+		warn "ERROR: $client: $device->{displayName}: invalid value for '$MYCLIENT'\n";
 		next DEVICE;
 	    }
 
@@ -176,7 +176,7 @@ for my $device (@$devices) {
 	    }
 	}
 	else {
-	    warn "ERROR: $device->{displayName}: $MYCLIENT property undefined\n";
+	    warn "ERROR: $device->{displayName}: '$MYCLIENT' property undefined\n";
 	    next DEVICE;
 	}
     }
