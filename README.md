@@ -9,7 +9,7 @@
     COMPANY1:
         access_id: 'ACCESS_ID'
         access_key: 'ACCESS_KEY'
-    COMPANY1:
+    COMPANY2:
         access_id: 'ACCESS_ID'
         access_key: 'ACCESS_KEY'
  ```
