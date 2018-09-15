@@ -12,6 +12,9 @@
     COMPANY2:
         access_id: 'ACCESS_ID'
         access_key: 'ACCESS_KEY'
+    COMPANY3:
+        access_id: 'ACCESS_ID'
+        access_key: 'ACCESS_KEY'
  ```
 
 * lm-get-configs
