@@ -13,7 +13,7 @@
 # Anaheim, CA 92807
 #
 # 714-630-4772 (voice)
-# 714-844-4698 (fax)
+# 714-860-4940 (fax)
 #
 # http://www.willingminds.com/
 #
@@ -41,6 +41,7 @@ use Data::Dumper;
 use Text::CSV_XS;
 use Time::HiRes qw(time);
 use IO::File;
+use Cisco::Reconfig ();
 
 use lib "$Bin";
 use WM::LMAPI;
@@ -54,6 +55,7 @@ use warnings;
 my $DRYRUN = 0;
 my $VERBOSE = 0;
 my $COMPANY;
+my $CLIENT = "wm.client";
 
 Getopt::Long::Configure ("bundling");
 
@@ -61,6 +63,7 @@ GetOptions(
     "dryrun|n"		=> \$DRYRUN,
     "verbose|v+"	=> \$VERBOSE,
     "company|c=s"	=> \$COMPANY,
+    "client|C=s"	=> \$CLIENT,	# property name identifying client
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
@@ -89,18 +92,22 @@ for my $device (@$devices) {
     my $devicedatasources  = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources", filter=>"dataSourceType:CS", fields => "id,dataSourceName");
     my $query_end = time;
     $query_total += ($query_end - $query_start);
+    my $devicename = $device->{displayName};
+    my $properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
+    my $sysinfo = getprop($properties, 'system.sysinfo');
+
     if (@$devicedatasources) {
-	# determine client name (must be defined in wm.client custom property -- LM has no actual multitenancy support)
-	my $properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
-	if (my $client = getprop($properties, 'wm.client')) {
+	# determine client name (must be defined in a custom property (CLIENT) -- LM has no actual multitenancy support)
+
+	if (my $client = getprop($properties, $CLIENT)) {
 	    # validate input string
 	    if ($client !~ /^\w+$/) {
-		warn "ERROR: $client: $device->{displayName}: invalid value for wm.client\n";
+		warn "ERROR: $client: $devicename: invalid value for $CLIENT\n";
 		next DEVICE;
 	    }
 
 	    # ensure target directory exists
-	    my $dirname = "lmconfig-$client";
+	    my $dirname = "$COMPANY-$client";
 	    if (not -d $dirname) {
 		if (not mkdir($dirname)) {
 		    warn "ERROR: $dirname: unable to create directory: $!\n";
@@ -115,7 +122,7 @@ for my $device (@$devices) {
 		# dump metadata
 		my $configSourceName = $devicedatasource->{dataSourceName};
 		if (length $configSourceName) {
-		    my $label = "$device->{displayName}.dataSourceName";
+		    my $label = "$devicename.dataSourceName";
 		    if (my $fh = IO::File->new(">$dirname/$label")) {
 			print $fh "$configSourceName\n";
 		    }
@@ -131,7 +138,8 @@ for my $device (@$devices) {
 		    if (defined $instance->{id}) {
 			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
 			for my $c (@$config) {
-			    my $label = "$c->{deviceDisplayName}.$c->{instanceName}";
+			    my $instancename = $c->{instanceName};
+			    my $label = "$devicename.$instancename";
 			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
 			    verbose 2, "label=$label\n";
 			    if ($label =~ /^[\w._-]+$/) {
@@ -141,9 +149,24 @@ for my $device (@$devices) {
 				if ($configSourceName eq "Cisco_IOS") {
 				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
+				    # new idiocy introduced in Cisco_IOS 0.0.31
+				    $c->{config} =~ s/\ANo view is active ! Currently in Privilege Level Context\s*//smi;
 				    if ($c->{config} =~ /^line con ([1-9].*)/m) {
 					warn "ERROR: $dirname/$label: bogus 'line con $1' in config due to LM bugs, skipping\n";
 					next INSTANCE;
+				    }
+				    
+				    ### DISABLED FOR NOW - Cisco::Reconfig failing on too many inputs
+				    if (0 and $sysinfo =~ /^Cisco IOS/ and $instancename =~ /-config$/) {
+					eval {
+					    if (my $parsed_config = Cisco::Reconfig::stringconfig($c->{config})) {
+						$parsed_config->set("line aux 0", "speed", undef);
+						$c->{config} = $parsed_config->alltext();
+					    }
+					};
+					if ($@) {
+					    warn "ERROR: unable to parse $label: $@\n";
+					}
 				    }
 				}
 
@@ -153,7 +176,13 @@ for my $device (@$devices) {
 				elsif ($c->{config} =~ /^false$/) {
 				    warn "ERROR: $dirname/$label: bogus 'false' result, skipping\n";
 				}
-				elsif ($c->{config} =~ /^(%Error.*)$/m) {
+				elsif ($c->{config} =~ /^(%Error.*)$/im) {
+				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				}
+				elsif ($c->{config} =~ /^(Unable to get configuration|configuration change in progress)/im) {
+				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				}
+				elsif ($c->{config} =~ /^(The flash device is in use by another task.*)/im) {
 				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
 				}
 				else {
@@ -175,7 +204,7 @@ for my $device (@$devices) {
 	    }
 	}
 	else {
-	    warn "ERROR: $device->{displayName}: wm.client property undefined\n";
+	    warn "ERROR: $devicename: $CLIENT property undefined\n";
 	    next DEVICE;
 	}
     }
