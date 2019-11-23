@@ -224,6 +224,9 @@ sub _version {
 	elsif ($path =~ m:^/setting/(role|admin)/groups:) {
 	    $version = 3;
 	}
+	elsif ($path =~ m:^/setting/(oids|functions|eventsources|propertyrules|batchjobs|topologysources)\b:) {
+	    $version = 3;
+	}
 	elsif ($path =~ m:^(/device/unmonitoreddevices)$:) {
 	    $version = 3;
 	}
