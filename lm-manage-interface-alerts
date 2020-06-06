@@ -1,0 +1,249 @@
+#! /usr/bin/perl
+
+# lm-manage-interface-alerts
+# 
+# This script uses the LogicMonitor REST API to scan all snmp*If DS
+# instances and use rules (patterns applied to interface descriptions)
+# to update the disableAlerting and/or stopMonitoring attributes to
+# avoid unnecessary polling and/or alarms.
+#
+#------------------------------------------------------------------------------
+# Copyright (c) 2020 by Willing Minds LLC
+# All Rights Reserved.
+#
+# 1240 N. Van Buren Street #107
+# Anaheim, CA 92807
+#
+# 714-630-4772 (voice)
+# 714-860-4940 (fax)
+#
+# http://www.willingminds.com/
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#------------------------------------------------------------------------------
+
+use FindBin qw($Script $Bin);
+use JSON;
+use Getopt::Long;
+use Data::Dumper;
+
+use lib $Bin;
+use WM::LMAPI;
+
+use strict;
+use warnings;
+
+#------------------------------------------------------------------------------
+
+# option defaults
+my $DRYRUN = 0;
+my $VERBOSE = 0;
+my $COMPANY;
+my $CHECKPEERS;
+
+Getopt::Long::Configure ("bundling");
+
+GetOptions(
+    "dryrun|n"		=> \$DRYRUN,
+    "verbose|v+"	=> \$VERBOSE,
+    "company|c=s"	=> \$COMPANY,
+    "checkpeers!"	=> \$CHECKPEERS,
+) or die;
+
+die "ERROR: must define company\n" if not defined($COMPANY);
+
+if ($DRYRUN) {
+    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
+}
+
+sub verbose ($@) {
+    my $minverbose = shift;
+    print join("", @_) if $VERBOSE >= $minverbose;
+}
+
+my $lmapi = WM::LMAPI->new(company => $COMPANY) or die;
+
+#------------------------------------------------------------------------------
+
+# interface alert/monitor policy inputs
+#
+# property: wm.intf.peers: one or more peer devices (comma-separated); disable 
+#                          alerting if any peer equivalent interface is up
+# property: wm.intf.desc.alert description match regex to enable alerting
+# property: wm.intf.desc.noalert description match regex to disable alerting
+# property: wm.intf.desc.monitor description match regex to enable monitoring
+# property: wm.intf.desc.nomonitor description match regex to disable monitoring
+#
+# NOTE: a resolved property value of 'null' (no quotes) will undefine the property
+#
+# property: wm.intf.email.<label>: email notification address for changes to in-scope 
+#                                  interfaces; multiple addresses used together via label 
+#                                  composition (use 'null' to undefine downstream)
+#
+# If an interface description matches neither pattern, no change is made to collection or monitoring.
+#
+# The default policy, appropriate for most core/distribution gear, is:
+#
+# wm.intf.desc.monitor .*
+# wm.intf.desc.alert: .+
+# wm.intf.desc.noalert: ^#|^$
+# 
+# Translation: Collect all ports, and alert on labeled ports except those with a leading '#'. Ports
+# without labels will not be changed for either monitoring or alerting.
+#
+# Another useful policy, appropriate for most edge gear, is:
+#
+# wm.intf.desc.monitor .+
+# wm.intf.desc.nomonitor ^$
+# wm.intf.desc.alert: .+
+# wm.intf.desc.noalert: ^#
+#
+# Translation: Collect only ports with labels, and alert on all ports except those with a leading '#'. Ports
+# without labels will be disabled for monitoring and alerting.
+
+my $devices = $lmapi->get_all(path => "/device/devices", fields => "id,displayName,preferredCollectorGroupId");
+DEVICE:
+for my $d (@{$devices}) {
+    verbose 2, "working on $d->{displayName}\n";
+    ##alarm(30);
+    
+    # extract custom monitoring/alerting properties (assigned to devices directly or inherited)
+    my %propvals;
+
+    # set default values
+    $propvals{'wm.intf.desc.monitor'} = '.*';
+    $propvals{'wm.intf.desc.alert'} = '.+';
+    $propvals{'wm.intf.desc.noalert'} = '^#|^$';
+
+    my $deviceproperties = $lmapi->get_all(path => "/device/devices/$d->{id}/properties");
+    if (ref($deviceproperties) eq 'ARRAY') {
+	for my $p (grep { $_->{name} =~ /^wm\.intf\./ } @{$deviceproperties}) {
+	    if ($p->{value} eq "null") {
+		# hack to remove a property since LM has no method to do this (yet)
+		delete $propvals{$p->{name}};
+	    }
+	    else {
+		$propvals{$p->{name}} = $p->{value};
+	    }
+	}
+    }
+
+    # resolve peer device IDs if defined
+    my @peerdevices;
+    if ($CHECKPEERS and defined $propvals{'wm.intf.peers'}) {
+	verbose 2, "checking peer devices\n";
+	for my $peername (split(/\s*,\s*/, $propvals{'wm.intf.peers'})) {
+	    verbose 2, "finding peer device $peername\n";
+	    if (my $pdlist = $lmapi->get_all(path => "/device/devices", fields => "id,displayName", filter => "preferredCollectorGroupId:$d->{preferredCollectorGroupId},displayName:$peername")) {
+		for my $pd (@$pdlist) {
+		    verbose 2, "located peer device name=$pd->{displayName}, id=$pd->{id}\n";
+		    push(@peerdevices, $pd);
+		}
+	    }
+	}
+    }
+
+    # get a list of all interface datasources (WIP: hardcoded pattern for now)
+    my $devicedatasources = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources", filter => 'dataSourceName~snmp*If');
+
+    DATASOURCE:
+    for my $ds (@{$devicedatasources}) {
+	my $peer_data;
+	if (@peerdevices) {
+	    for my $id ($d->{id}, map { $_->{id} } @peerdevices) {
+		verbose 2, "requesting last 15m of Status data for device $id\n";
+		$peer_data->{$id} = $lmapi->get_data_nonpaged(
+		    path => "/device/devices/$id/devicedatasources/$ds->{id}/data",
+		    datapoints => "Status",
+		    period => 0.25,
+		);
+		verbose 2, Dumper($peer_data->{$id});
+	    }
+	}
+
+	# get a list of all instances for this DS
+	my $devicedatasourceinstances = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances");
+
+	INSTANCE:
+	for my $dsi (@{$devicedatasourceinstances}) {
+
+	    my $put_data = {
+	       	groupId => $dsi->{groupId},
+		displayName => $dsi->{displayName},
+	       	description => $dsi->{description},
+	       	wildValue => $dsi->{wildValue},
+	       	disableAlerting => $dsi->{disableAlerting},
+	       	stopMonitoring => $dsi->{stopMonitoring},
+	    };
+	    my $commit_needed = 0;
+
+	    my $alert = ($propvals{'wm.intf.desc.alert'} || '');
+	    my $noalert = ($propvals{'wm.intf.desc.noalert'} || '');
+	    my $monitor = ($propvals{'wm.intf.desc.monitor'} || '');
+	    my $nomonitor = ($propvals{'wm.intf.desc.nomonitor'} || '');
+
+	    verbose 2, "working on $d->{displayName}:$dsi->{displayName} ($dsi->{description})\n";
+	    verbose 3, "     alert: '$alert'\n";
+	    verbose 3, "   noalert: '$noalert'\n";
+	    verbose 3, "   monitor: '$monitor'\n";
+	    verbose 3, " nomonitor: '$nomonitor'\n";
+
+	    # determine if this instance should have alerting enabled or disabled
+	    my $disableAlerting;
+	    if ($alert and $dsi->{description} =~ /$alert/) {
+		verbose 3, "alert condition matched, disableAlerting -> false\n";
+		$disableAlerting = JSON::false;
+	    }
+	    if ($noalert and $dsi->{description} =~ /$noalert/) {
+		verbose 3, "noalert condition matched, disableAlerting -> true\n";
+		$disableAlerting = JSON::true;
+	    }
+	    if (defined($disableAlerting) and $dsi->{disableAlerting} != $disableAlerting) {
+		$put_data->{disableAlerting} = $disableAlerting;
+		$commit_needed = 1;
+	    }
+
+	    # determine if this instance should have monitoring enabled or disabled
+	    my $stopMonitoring;
+	    if ($monitor and $dsi->{description} =~ /$monitor/) {
+		verbose 3, "monitor condition matched, stopMonitoring -> false\n";
+		$stopMonitoring = JSON::false;
+	    }
+	    if ($nomonitor and $dsi->{description} =~ /$nomonitor/) {
+		verbose 3, "nomonitor condition matched, stopMonitoring -> true\n";
+		$stopMonitoring = JSON::true;
+	    }
+	    if (defined($stopMonitoring) and $dsi->{stopMonitoring} != $stopMonitoring) {
+		$put_data->{stopMonitoring} = $stopMonitoring;
+		$commit_needed = 1;
+	    }
+
+	    # commit changes to LM API if needed
+	    if ($commit_needed) {
+		###WIP: add this to the report for wm.intf.email.* targets in scope
+		my $content = to_json($put_data);
+		verbose 1, "committing change to $d->{displayName}:$dsi->{displayName}:\n\t$content\n";
+		if ($DRYRUN) {
+		    print qq(put(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances/$dsi->{id}", content => $content)\n);
+		}
+		else {
+		    $lmapi->put(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances/$dsi->{id}", content => $content);
+		}
+	    }
+	}
+    }
+}
+
+exit;

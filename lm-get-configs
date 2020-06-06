@@ -143,9 +143,10 @@ for my $device (@$devices) {
 			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
 			    verbose 2, "label=$label\n";
 			    if ($label =~ /^[\w._-]+$/) {
+				# trim trailing whitespace from all lines
+				$c->{config} =~ s/\s*$//smg;
+
 				# preprocess results since LM cannot seem to program properly
-				$c->{config} =~ s/^\s*//s;
-				$c->{config} =~ s/\s*$//s;
 				if ($configSourceName eq "Cisco_IOS") {
 				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
@@ -168,6 +169,20 @@ for my $device (@$devices) {
 					    warn "ERROR: unable to parse $label: $@\n";
 					}
 				    }
+				}
+				elsif ($configSourceName eq "SonicWall_SonicOS") {
+				    # LM code creates new versions each time for "chatter" changes (e.g., scramble key, timestamps, etc.).
+				    $c->{config} =~ s/^system-(?:up)?time\s+"[^"]+"$//smig;
+				    # Encoded passwords can be 48, 80, 144 characters or longer
+				    $c->{config} =~ s/(\s+4,)[0-9a-f]{48}$/$1<<SUPPRESSED>>/smig;
+				    $c->{config} =~ s/(\s+4,)[0-9a-f]{64}$/$1<<SUPPRESSED>>/smig;
+				    $c->{config} =~ s/(\s+4,)[0-9a-f]{80}$/$1<<SUPPRESSED>>/smig;
+				    $c->{config} =~ s/(\s+4,)[0-9a-f]{144,}$/$1<<SUPPRESSED>>/smig;
+				    $c->{config} =~ s/^checksum\s+\d+$//smig;
+				}
+				elsif ($configSourceName eq "Fortinet_FortiOS") {
+				    # strip encoded passwords (change regularly due to scramble key updates)
+				    $c->{config} =~ s:\b(ENC\s+)[a-z0-9+/]{32,}==$:$1<<SUPPRESSED>>:smig;
 				}
 
 				if ($c->{config} =~ /^\s*$/s) {

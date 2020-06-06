@@ -95,8 +95,13 @@ sub get_one {
 
 sub get_all {
     my $self = shift;
-    my %args = @_;
+    my %args = (
+	raw => 0,
+	@_,
+    );
     my $items = [];
+
+    my $raw = $args{raw};
 
     my $pagesize = 50; # default, but don't assume!
     my $maxitems = $args{size};
@@ -109,8 +114,13 @@ sub get_all {
 	if (my $json = $self->_get(%args, size => $fetchsize, offset => $offset)) {
 	    if ($json->{status} == 200) {
 		if (my $jsonitems = _jsonitems($json)) {
-		    push(@$items, @{$jsonitems});
-		    # this should not be neededm but at least once we have
+		    if ($raw){
+			push (@$items, $json->{json});
+		    }
+		    else {
+			push(@$items, @{$jsonitems});
+		    }
+		    # this should not be needed but at least once we have
 		    # had items returned at offsets where they don't exist.
 		    last if (@$jsonitems < $pagesize);
 		}
@@ -224,10 +234,13 @@ sub _version {
 	elsif ($path =~ m:^/setting/(role|admin)/groups:) {
 	    $version = 3;
 	}
-	elsif ($path =~ m:^/setting/(oids|functions|eventsources|propertyrules|batchjobs|topologysources)\b:) {
+	elsif ($path =~ m:^/setting/(oids|functions|configsources|eventsources|propertyrules|batchjobs|topologysources|registry)\b:) {
 	    $version = 3;
 	}
 	elsif ($path =~ m:^(/device/unmonitoreddevices)$:) {
+	    $version = 3;
+	}
+	elsif ($path =~ m:^(/website/websites)$:) {
 	    $version = 3;
 	}
 	else {
@@ -245,6 +258,9 @@ sub _get {
     my @args;
 
     my $path = $opts{'path'};
+
+    my $raw = 0;
+    $raw = $opts{'raw'} if defined $opts{'raw'};
 
     # set explicit version, or implicitly for known v2-only paths
     my $version = $self->_version(%opts);
@@ -264,6 +280,7 @@ sub _get {
 	'Authorization' => $auth,
 	'Content-Type' => 'application/json',
 	'Accept' => 'application/json',
+	# 'Referer' => $self->{referbase},
     );
     if ($version > 1) {
 	push(@headers, "X-version" => "$version");
@@ -273,6 +290,9 @@ sub _get {
 	if (my $response = $ua->request( $req )) {
 	    if ($response->is_success) {
 		my $hash = from_json($response->content);
+		if ($raw){
+		    $hash->{json} = $response->content;
+		}
 		$hash->{status} = $response->code unless defined $hash->{status};
 		return $hash;
 	    }
