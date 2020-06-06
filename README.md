@@ -19,3 +19,6 @@
 
 * run-lm-get-configs
   * wrapper for lm-get-configs, uses git after refresh to update repository
+
+* lm-manage-interface-alerts
+  * update network interface monitor and alert settings based on regex properties
