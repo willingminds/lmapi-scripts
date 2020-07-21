@@ -81,6 +81,11 @@ sub initialize {
     $self->{referbase} = "https://${company}.logicmonitor.com/santaba/uiv3";
 }
 
+sub company {
+    my $self = shift;
+    return $self->{company};
+}
+
 sub get_one {
     my $self = shift;
     my %args = @_;
@@ -137,7 +142,7 @@ sub get_all {
 		$offset += $fetchsize;
 	    }
 	    else {
-		croak "get_all: $json->{status} $json->{errmsg}\n";
+		croak "$self->{company}: get_all(@{[Data::Dumper->Dump([\%args], [qw(args)])]}): $json->{status} $json->{errmsg}\n";
 	    }
 	}
 	else {
@@ -166,9 +171,9 @@ sub get_data_nonpaged {
 	$etime = $args{start};
 	$stime = $args{end};
     }
-    croak "get_data: start time not defined" unless defined $stime;
-    croak "get_data: end time not defined" unless defined $etime;
-    croak "get_data: time warp (start after end)" if $stime > $etime;
+    croak "$self->{company}: get_data: start time not defined" unless defined $stime;
+    croak "$self->{company}: get_data: end time not defined" unless defined $etime;
+    croak "$self->{company}: get_data: time warp (start after end)" if $stime > $etime;
     $stime *= 1000;
     $etime *= 1000;
 
@@ -180,7 +185,7 @@ sub get_data_nonpaged {
 	    }
 	}
 	else {
-	    croak "get_data: $json->{status} $json->{errmsg}\n" unless
+	    croak "$self->{company}: get_data: $json->{status} $json->{errmsg}\n" unless
 		$json->{status} == 1007		# Such datapoints([XXX]) do not belong to current datasource(ID=NNN).
 	     or $json->{status} == 1069;	# device<NNN> has no such DeviceDataSource
 	}
@@ -234,7 +239,7 @@ sub _version {
 	elsif ($path =~ m:^/setting/(role|admin)/groups:) {
 	    $version = 3;
 	}
-	elsif ($path =~ m:^/setting/(oids|functions|configsources|eventsources|propertyrules|batchjobs|topologysources|registry)\b:) {
+	elsif ($path =~ m:^/setting/(oids|functions|configsources|eventsources|propertyrules|batchjobs|topologysources|registry|alert/dependencyrules)\b:) {
 	    $version = 3;
 	}
 	elsif ($path =~ m:^(/device/unmonitoreddevices)$:) {

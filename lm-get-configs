@@ -85,15 +85,36 @@ my %columns;
 my $query_total = 0;
 my $query_cs = 0;
 
-my $devices  = $lmapi->get_all(path => "/device/devices", fields => "id,systemProperties,displayName");
+my $devices;
+eval {
+    $devices = $lmapi->get_all(path => "/device/devices", filter => 'deletedTimeInMs:0', fields => "id,systemProperties,displayName");
+};
+if ($@) {
+    warn "$COMPANY: unable to load devices\n$@\n";
+    exit 1;
+}
 DEVICE:
 for my $device (@$devices) {
     my $query_start = time;
-    my $devicedatasources  = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources", filter=>"dataSourceType:CS", fields => "id,dataSourceName");
+    my $devicedatasources;
+    eval {
+	$devicedatasources = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources", filter=>"dataSourceType:CS", fields => "id,dataSourceName");
+    };
+    if ($@) {
+	warn "$COMPANY $device->{displayName}: unable to load configsources:\n$@\n";
+	next DEVICE;
+    }
     my $query_end = time;
     $query_total += ($query_end - $query_start);
     my $devicename = $device->{displayName};
-    my $properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
+    my $properties;
+    eval {
+	$properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
+    };
+    if ($@) {
+	warn "$COMPANY $device->{displayName}: unable to load properties\n$@\n";
+	next DEVICE;
+    }
     my $sysinfo = getprop($properties, 'system.sysinfo');
 
     if (@$devicedatasources) {
@@ -117,29 +138,30 @@ for my $device (@$devices) {
 
 	    # copy LMConfig data for this device
 	    for my $devicedatasource (@$devicedatasources) {
-		$query_cs++;
-
-		# dump metadata
 		my $configSourceName = $devicedatasource->{dataSourceName};
-		if (length $configSourceName) {
-		    my $label = "$devicename.dataSourceName";
-		    if (my $fh = IO::File->new(">$dirname/$label")) {
-			print $fh "$configSourceName\n";
-		    }
-		    else {
-			warn "ERROR: $dirname/$label: $!\n";
-		    }
-		}
+		$query_cs++;
 
 		# dump configuration instances
 		my $instances = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances");
 		INSTANCE:
 		for my $instance (@$instances) {
 		    if (defined $instance->{id}) {
+			
 			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
 			for my $c (@$config) {
 			    my $instancename = $c->{instanceName};
 			    my $label = "$devicename.$instancename";
+			    
+			    # dump metadata
+			    if (length $configSourceName) {
+				if (my $fh = IO::File->new(">$dirname/$label.configSourceName")) {
+				    print $fh "$configSourceName\n";
+				}
+				else {
+				    warn "ERROR: $dirname/$label.configSourceName: $!\n";
+				}
+			    }
+
 			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
 			    verbose 2, "label=$label\n";
 			    if ($label =~ /^[\w._-]+$/) {
@@ -183,6 +205,14 @@ for my $device (@$devices) {
 				elsif ($configSourceName eq "Fortinet_FortiOS") {
 				    # strip encoded passwords (change regularly due to scramble key updates)
 				    $c->{config} =~ s:\b(ENC\s+)[a-z0-9+/]{32,}==$:$1<<SUPPRESSED>>:smig;
+				}
+				elsif ($configSourceName eq "Cisco_WLC_RunningConfig") {
+				    # ignore items that change frequently
+				    $c->{config} =~ s/^\s*rogue (?:adhoc|client) alert \S+\s*\n//smig;
+				}
+				elsif ($configSourceName eq "Cisco_WLC_FirewallRules") {
+				    # strip ephemeral packet counters from rules dump (should not be in the file to begin with)
+				    $c->{config} =~ s/\s+\d+\s+\d*\s*\n/\n/smig;
 				}
 
 				if ($c->{config} =~ /^\s*$/s) {

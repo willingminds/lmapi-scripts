@@ -113,7 +113,15 @@ my $lmapi = WM::LMAPI->new(company => $COMPANY) or die;
 # Translation: Collect only ports with labels, and alert on all ports except those with a leading '#'. Ports
 # without labels will be disabled for monitoring and alerting.
 
-my $devices = $lmapi->get_all(path => "/device/devices", fields => "id,displayName,preferredCollectorGroupId");
+my $devices;
+eval {
+    $devices = $lmapi->get_all(path => "/device/devices", filter => 'deletedTimeInMs:0', fields => "id,displayName,preferredCollectorGroupId");
+};
+if ($@) {
+    warn "$COMPANY: unable to load devices\n$@\n";
+    exit 1;
+}
+
 DEVICE:
 for my $d (@{$devices}) {
     verbose 2, "working on $d->{displayName}\n";
@@ -127,7 +135,15 @@ for my $d (@{$devices}) {
     $propvals{'wm.intf.desc.alert'} = '.+';
     $propvals{'wm.intf.desc.noalert'} = '^#|^$';
 
-    my $deviceproperties = $lmapi->get_all(path => "/device/devices/$d->{id}/properties");
+    my $deviceproperties;
+    eval {
+	$deviceproperties = $lmapi->get_all(path => "/device/devices/$d->{id}/properties");
+    };
+    if ($@) {
+	warn "$COMPANY: $d->{displayName}: unable to load device properties\n$@\n";
+	next DEVICE;
+    }
+
     if (ref($deviceproperties) eq 'ARRAY') {
 	for my $p (grep { $_->{name} =~ /^wm\.intf\./ } @{$deviceproperties}) {
 	    if ($p->{value} eq "null") {
@@ -156,7 +172,14 @@ for my $d (@{$devices}) {
     }
 
     # get a list of all interface datasources (WIP: hardcoded pattern for now)
-    my $devicedatasources = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources", filter => 'dataSourceName~snmp*If');
+    my $devicedatasources;
+    eval {
+	$devicedatasources = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources", filter => 'dataSourceName~snmp*If');
+    };
+    if ($@) {
+	warn "$COMPANY: $d->{displayName}: unable to load device interfaces\n$@\n";
+	next DEVICE;
+    }
 
     DATASOURCE:
     for my $ds (@{$devicedatasources}) {
