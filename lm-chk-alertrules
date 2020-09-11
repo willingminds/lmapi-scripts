@@ -1,0 +1,107 @@
+#! /usr/bin/perl
+
+# lm-chk-alertrules
+# 
+# Copyright 2020 by Willing Minds LLC
+# 
+# This script uses the LogicMonitor REST API to perform sanity checks on alert rules.
+
+use FindBin qw($Script $Bin);
+use LWP 5.8;
+use Getopt::Long;
+use Data::Dumper;
+
+use lib "$Bin";
+use WM::LMAPI;
+
+use strict;
+use warnings;
+
+#------------------------------------------------------------------------------
+
+# option defaults
+my $DRYRUN = 0;
+my $VERBOSE = 0;
+my $COMPANY;
+
+Getopt::Long::Configure ("bundling");
+
+GetOptions(
+    "dryrun|n"		=> \$DRYRUN,
+    "verbose|v+"	=> \$VERBOSE,
+    "company|c=s"	=> \$COMPANY,
+) or die;
+
+die "ERROR: must define company\n" if not defined($COMPANY);
+
+if ($DRYRUN) {
+    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
+}
+
+sub verbose ($@) {
+    my $minverbose = shift;
+    print join("", @_) if $VERBOSE >= $minverbose;
+}
+
+my $lmapi = WM::LMAPI->new(company => $COMPANY) or die;
+
+my $DATASOURCES = $lmapi->get_all(path => "/setting/datasources", fields => "id,name,displayName");
+my $EVENTSOURCES = $lmapi->get_all(path => "/setting/eventsources", fields => "id,name");
+my $CONFIGSOURCES = $lmapi->get_all(path => "/setting/configsources", fields => "id,name,displayName");
+
+my $alertrules  = $lmapi->get_all(path => "/setting/alert/rules");
+for my $ar (@$alertrules) {
+    verbose 1, "$ar->{name}: $ar->{escalatingChain}->{name}\n";
+
+    check_modules($ar);
+}
+
+sub check_modules {
+    my $ar = shift;
+
+    my $moduleglob = $ar->{datasource};
+
+    verbose 1, " checking module pattern '$moduleglob'\n";
+
+    if ($moduleglob eq "*") {
+	verbose 1, "  matches all modules\n";
+	return;
+    }
+
+    if ($moduleglob eq "website") {
+	verbose 1, "  website check\n";
+	return;
+    }
+
+    my $dscount = find_lm_glob($moduleglob, [map { $_->{displayName} } @$DATASOURCES]);
+    verbose 1, "  matches $dscount datasource(s)\n";
+    return if $dscount > 0;
+
+    my $escount = find_lm_glob($moduleglob, [map { $_->{name} } @$EVENTSOURCES]);
+    verbose 1, "  matches $escount eventsource(s)\n";
+    return if $escount > 0;
+
+    my $cscount = find_lm_glob($moduleglob, [map { $_->{displayName} } @$CONFIGSOURCES]);
+    verbose 1, "  matches $cscount configsource(s)\n";
+    return if $cscount > 0;
+
+    warn "ERROR: $ar->{name}: module pattern '$moduleglob' matches no modules\n";
+}
+
+sub find_lm_glob {
+    my $glob = shift;
+    my $table = shift;
+    my $count = 0;
+
+    # convert glob to regex
+    my $pat = $glob;
+    $pat =~ s/\?/.?/g;
+    $pat =~ s/\*/.*/g;
+    verbose 1, "pat: $pat\n";
+
+    if (ref $table eq "ARRAY") {
+	$count = scalar grep { /^$pat$/ } @$table;
+    }
+
+    return $count;
+}
