@@ -6,7 +6,7 @@
 # local archiving, searching and reporting purposes.
 
 #------------------------------------------------------------------------------
-# Copyright (c) 2018 by Willing Minds LLC
+# Copyright (c) 2018-2021 by Willing Minds LLC
 # All Rights Reserved.
 #
 # 1240 N. Van Buren Street #107
@@ -37,11 +37,13 @@
 use FindBin qw($Script $Bin);
 use LWP 5.8;
 use Getopt::Long;
-use Data::Dumper;
+use Date::Parse;
 use Text::CSV_XS;
 use Time::HiRes qw(time);
 use IO::File;
-use Cisco::Reconfig ();
+use XML::Twig;
+use Module::Load;
+use Data::Dumper;
 
 use lib "$Bin";
 use WM::LMAPI;
@@ -52,25 +54,29 @@ use warnings;
 #------------------------------------------------------------------------------
 
 # option defaults
-my $DRYRUN = 0;
 my $VERBOSE = 0;
 my $COMPANY;
 my $CLIENT = "wm.client";
+my @EXCLUDECS;
+my @INCLUDECS;
+my @DEVICES;
+my $STALEPOLLTIME = 240;	# ignore configuration data with a stale pollTimestamp older than this (minutes)
 
 Getopt::Long::Configure ("bundling");
 
 GetOptions(
-    "dryrun|n"		=> \$DRYRUN,
+    "dryrun|n"		=> \$WM::LMAPI::DRYRUN,
+    "trace|t=i"		=> \$WM::LMAPI::TRACE,
     "verbose|v+"	=> \$VERBOSE,
     "company|c=s"	=> \$COMPANY,
     "client|C=s"	=> \$CLIENT,	# property name identifying client
+    "excludecs|E=s"	=> \@EXCLUDECS,
+    "includecs|I=s"	=> \@INCLUDECS,
+    "device|D=s"	=> \@DEVICES,
+    "stalepolltime=i"	=> \$STALEPOLLTIME,
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
-
-if ($DRYRUN) {
-    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
-}
 
 sub verbose ($@) {
     my $minverbose = shift;
@@ -84,6 +90,7 @@ my %columns;
 
 my $query_total = 0;
 my $query_cs = 0;
+my $query_devices = 0;
 
 my $devices;
 eval {
@@ -93,8 +100,14 @@ if ($@) {
     warn "$COMPANY: unable to load devices\n$@\n";
     exit 1;
 }
+
 DEVICE:
 for my $device (@$devices) {
+    my $devicename = $device->{displayName};
+    if (@DEVICES and not grep { lc($devicename) eq lc($_) } @DEVICES) {
+	next DEVICE;
+    }
+    $query_devices++;
     my $query_start = time;
     my $devicedatasources;
     eval {
@@ -106,7 +119,6 @@ for my $device (@$devices) {
     }
     my $query_end = time;
     $query_total += ($query_end - $query_start);
-    my $devicename = $device->{displayName};
     my $properties;
     eval {
 	$properties = $lmapi->get_all(path => "/device/devices/$device->{id}/properties");
@@ -116,6 +128,10 @@ for my $device (@$devices) {
 	next DEVICE;
     }
     my $sysinfo = getprop($properties, 'system.sysinfo');
+    my %category;
+    if (my $categories = getprop($properties, 'system.categories')) {
+	%category = map { lc $_ => 1 } split(/,/, $categories);
+    }
 
     if (@$devicedatasources) {
 	# determine client name (must be defined in a custom property (CLIENT) -- LM has no actual multitenancy support)
@@ -127,7 +143,7 @@ for my $device (@$devices) {
 		next DEVICE;
 	    }
 
-	    # ensure target directory exists
+	    # ensure target directory exists (except in dry run mode)
 	    my $dirname = "$COMPANY-$client";
 	    if (not -d $dirname) {
 		if (not mkdir($dirname)) {
@@ -137,32 +153,70 @@ for my $device (@$devices) {
 	    }
 
 	    # copy LMConfig data for this device
+	    CONFIGSOURCE:
 	    for my $devicedatasource (@$devicedatasources) {
 		my $configSourceName = $devicedatasource->{dataSourceName};
+
+		if (@INCLUDECS and not grep { lc($_) eq lc($configSourceName) } @INCLUDECS) {
+		    verbose 1, "skipping $configSourceName (not in include list)\n";
+		    next CONFIGSOURCE;
+		}
+
+		if (@EXCLUDECS and grep { lc($_) eq lc($configSourceName) } @EXCLUDECS) {
+		    verbose 1, "skipping $configSourceName (in exclude list)\n";
+		    next CONFIGSOURCE;
+		}
+
 		$query_cs++;
 
+		my $skip_empty_check = 0;
+		my $skip_empty_check_expired;
+		if (defined (my $skip_empty_check_prop = getprop($properties, 'wm.lmconfig.skipempty.'.$configSourceName))) {
+		    if ($skip_empty_check_prop eq "1") {
+			$skip_empty_check = 1;
+		    }
+		    else {
+			if (my $expire_t = str2time($skip_empty_check_prop)) {
+			    if (time <= $expire_t) {
+				$skip_empty_check = 1;
+			    }
+			    else {
+				verbose 1, "skipempty for $configSourceName expired on $skip_empty_check_prop\n";
+				$skip_empty_check_expired = $skip_empty_check_prop;
+			    }
+			}
+		    }
+		}
+
 		# dump configuration instances
-		my $instances = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances");
+		my $instances = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances", filter => 'stopMonitoring:false');
 		INSTANCE:
 		for my $instance (@$instances) {
 		    if (defined $instance->{id}) {
 			
-			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
+			# Try it without the 'fields' clause to see if it gets fewer timeouts
+			#my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
+			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1, fields => "instanceName,config,pollTimestamp");
 			for my $c (@$config) {
 			    my $instancename = $c->{instanceName};
-			    my $label = "$devicename.$instancename";
+			    my $label = "$devicename.$configSourceName.$instancename";
 			    
-			    # dump metadata
-			    if (length $configSourceName) {
-				if (my $fh = IO::File->new(">$dirname/$label.configSourceName")) {
-				    print $fh "$configSourceName\n";
-				}
-				else {
-				    warn "ERROR: $dirname/$label.configSourceName: $!\n";
-				}
+			    # ignore this one if data is stale
+			    my $age = int((time - $c->{pollTimestamp}/1000)/60);
+			    if ($age > $STALEPOLLTIME) {
+			        verbose 1, "$label: skipping due to stale pollTimestamp (${age}m)\n";
+				next INSTANCE;
+			    }
+			    
+			    # check if any instances should be skipped
+			    if ($configSourceName eq "Cisco_WLC_DynamicConfigs") {
+				next INSTANCE if $instancename eq "run-config";
 			    }
 
+			    # preprocess labels that make for poor filenames
 			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
+			    $label =~ s:\s:_:g;	# needed when LM decides to embed SPACES in instance names
+
 			    verbose 2, "label=$label\n";
 			    if ($label =~ /^[\w._-]+$/) {
 				# trim trailing whitespace from all lines
@@ -174,13 +228,23 @@ for my $device (@$devices) {
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
 				    # new idiocy introduced in Cisco_IOS 0.0.31
 				    $c->{config} =~ s/\ANo view is active ! Currently in Privilege Level Context\s*//smi;
+
 				    if ($c->{config} =~ /^line con ([1-9].*)/m) {
 					warn "ERROR: $dirname/$label: bogus 'line con $1' in config due to LM bugs, skipping\n";
 					next INSTANCE;
 				    }
+
+				    if ($c->{config} =~ /^Command authorization failed/m) {
+					warn "ERROR: $dirname/$label: uncaught AAA error, skipping\n";
+					next INSTANCE;
+				    }
 				    
+				    eval {
+					load "Cisco::Reconfig";
+				    };
+				    my $has_cisco_reconfig = not defined $@;
 				    ### DISABLED FOR NOW - Cisco::Reconfig failing on too many inputs
-				    if (0 and $sysinfo =~ /^Cisco IOS/ and $instancename =~ /-config$/) {
+				    if (0 and $has_cisco_reconfig and $sysinfo =~ /^Cisco IOS/ and $instancename =~ /-config$/) {
 					eval {
 					    if (my $parsed_config = Cisco::Reconfig::stringconfig($c->{config})) {
 						$parsed_config->set("line aux 0", "speed", undef);
@@ -192,6 +256,10 @@ for my $device (@$devices) {
 					}
 				    }
 				}
+				elsif ($configSourceName eq "Cisco_NXOS") {
+				    # Latest ConfigSource adds a timestamp to the config
+				    $c->{config} =~ s/^!Time:\s\w{3}\s\w{3}\s\d+\s\d{2}:\d{2}:\d{2}\s\d{4}\s*$//smig;
+				}
 				elsif ($configSourceName eq "SonicWall_SonicOS") {
 				    # LM code creates new versions each time for "chatter" changes (e.g., scramble key, timestamps, etc.).
 				    $c->{config} =~ s/^system-(?:up)?time\s+"[^"]+"$//smig;
@@ -202,43 +270,122 @@ for my $device (@$devices) {
 				    $c->{config} =~ s/(\s+4,)[0-9a-f]{144,}$/$1<<SUPPRESSED>>/smig;
 				    $c->{config} =~ s/^checksum\s+\d+$//smig;
 				}
-				elsif ($configSourceName eq "Fortinet_FortiOS") {
+				elsif ($configSourceName eq "Fortinet_FortiOS" or 
+				       $configSourceName =~ /^ssh_(?:exec|interactive)_/i and ($category{fortigate} or $category{fortiswitch})) {
 				    # strip encoded passwords (change regularly due to scramble key updates)
-				    $c->{config} =~ s:\b(ENC\s+)[a-z0-9+/]{32,}==$:$1<<SUPPRESSED>>:smig;
+				    $c->{config} =~ s|\b(ENC\s+)[a-z0-9+/]{32,}==$|$1<<SUPPRESSED>>|smig;
 				}
-				elsif ($configSourceName eq "Cisco_WLC_RunningConfig") {
-				    # ignore items that change frequently
-				    $c->{config} =~ s/^\s*rogue (?:adhoc|client) alert \S+\s*\n//smig;
+				elsif ($configSourceName eq "Cisco_WLC_DynamicConfigs") {
+				    if ($instancename eq "rules") {
+					# strip ephemeral packet counters from firewall rules dump (should not be in the results)
+					$c->{config} =~ s/\s+\d+\s+\d*\s*\n/\n/smig;
+				    }
+				    elsif ($instancename eq "run-config commands") {
+					# ignore rogue ap alert "commands"
+					$c->{config} =~ s/^\s*rogue (?:adhoc|client) alert \S+\s*\n//smig;
+				    }
+				    elsif ($instancename eq "run-config startup-commands") {
+					# ignore timestamp lines
+					$c->{config} =~ s/^#\s+WLC Config (\S+)\s+<[^>]+>/# WLC Config $1/smig;
+				    
+					# suppress CDP timer values (a bit tricky with output LM produces)
+					$c->{config} =~ s/^(!\s+(?:Gig|Ten)\s\S+\s+)\d+(\s+.*?)$/${1}0${2}/smig;
+				    }
 				}
-				elsif ($configSourceName eq "Cisco_WLC_FirewallRules") {
-				    # strip ephemeral packet counters from rules dump (should not be in the file to begin with)
-				    $c->{config} =~ s/\s+\d+\s+\d*\s*\n/\n/smig;
+				elsif ($configSourceName eq "PaloAlto_FW_GlobalProtectGateway_ConfigXML") {
+				    # ignore useless revisions on the backend due to unfiltered ephemeral XML tags
+				    my $twig = XML::Twig->new(
+					pretty_print => 'indented',
+					keep_spaces => 1,
+					keep_encoding => 1,
+					twig_handlers => {
+					    'ip-pool-next-ip' => sub { $_->cut; },
+					    'ip-pool-next-ip-v6' => sub { $_->cut; },
+					},
+				    );
+				    if ($twig->safe_parse($c->{config})) {
+					$c->{config} = $twig->sprint;
+				    }
+				}
+				elsif ($configSourceName eq "HPE_Network_Config" or
+				       $configSourceName =~ /ssh_interactive_/i and $category{hpswitch}) {
+				    if ($c->{config} =~ /^invalid input:\s+/smig) {
+					warn "ERROR: $dirname/$label: $c->{config}\n";
+					next INSTANCE;
+				    }
+				    
+				    # Strip out "Startup Configuration: <d>" lines.  The numbers seem
+				    # to increment when there are no other changes.
+				    $c->{config} =~ s/^Startup Configuration: \d+\s*$//smig;
+				    
+				    # Strip ephemeral authorization line since LM can't write gud kode
+				    $c->{config} =~ s/^Attempting to authorize\.+\s*$//smig;
 				}
 
-				if ($c->{config} =~ /^\s*$/s) {
-				    warn "ERROR: $dirname/$label: empty result, skipping\n";
+				if ($c->{config} =~ /^\s*$/s and not $skip_empty_check) {
+				    # vlan data may be missing for some devices, not a problem here
+				    if ($configSourceName eq "Cisco_IOS") {
+					next INSTANCE if $instancename eq "vlan";
+				    }
+				    
+				    # Some of the Windows configsources can also be empty sometimes
+				    if ($configSourceName eq "Microsoft_ActiveDirectory_SitesSubnets") {
+					# this could be empty on AD servers with only one subnet
+					next INSTANCE;
+				    }
+
+				    my $empty_message = "ERROR: $dirname/$label: skipping empty result";
+
+				    # special case of "empty"
+				    if ($configSourceName =~ /^Microsoft_DHCP_/) {
+					if (my @winfeatures = split(/\s*,\s*/, getprop($properties, 'auto.winfeatures'))) {
+					    if (grep { lc($_) eq 'dhcp server' } @winfeatures) {
+						$empty_message = "ERROR: $dirname/$label: skipping empty result (DHCP server role incorrectly installed?)";
+					    }
+					    else {
+						$empty_message = "ERROR: $dirname/$label: skipping empty result (DHCP server role not installed - remove Windows_DHCP from system.categories)";
+					    }
+					}
+					else {
+					    $empty_message = "ERROR: $dirname/$label: skipping empty result (no Windows features found - check and possibly remove Windows_DHCP from system.categories)";
+					}
+				    }
+
+				    if (defined $skip_empty_check_expired) {
+					$empty_message .= " [skip property expired on $skip_empty_check_expired]";
+				    }
+				    warn "$empty_message\n";
+				    next INSTANCE;
 				}
-				elsif ($c->{config} =~ /^false$/) {
-				    warn "ERROR: $dirname/$label: bogus 'false' result, skipping\n";
+
+				if ($c->{config} =~ /^false$/) {
+				    warn "ERROR: $dirname/$label: skipping bogus 'false' result\n";
+				    next INSTANCE;
 				}
-				elsif ($c->{config} =~ /^(%Error.*)$/im) {
+
+				if ($c->{config} =~ /^(%Error.*)$/im) {
 				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				    next INSTANCE;
 				}
-				elsif ($c->{config} =~ /^(Unable to get configuration|configuration change in progress)/im) {
+
+				if ($c->{config} =~ /^(Unable to get configuration|configuration change in progress)/im) {
 				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				    next INSTANCE;
 				}
-				elsif ($c->{config} =~ /^(The flash device is in use by another task.*)/im) {
+
+				if ($c->{config} =~ /^(The flash device is in use by another task.*)/im) {
 				    warn "ERROR: $dirname/$label: skipping due to error: $1\n";
+				    next INSTANCE;
+				}
+
+				verbose 3, Dumper([sort keys %$c]);
+
+				if (my $fh = IO::File->new(">$dirname/$label")) {
+				    print $fh $c->{config}, "\n";
 				}
 				else {
-				    if (my $fh = IO::File->new(">$dirname/$label")) {
-					print $fh $c->{config}, "\n";
-				    }
-				    else {
-					warn "ERROR: open $dirname/$label: $!\n";
-				    }
+				    warn "ERROR: open $dirname/$label: $!\n";
 				}
-				verbose 3, Dumper([sort keys %$c]);
 			    }
 			    else {
 				warn "ERROR: $dirname/$label: invalid label format, skipping\n";
@@ -254,7 +401,7 @@ for my $device (@$devices) {
 	}
     }
 }
-verbose 1, sprintf("%s: queried %d devices for %d ConfigSources in %.1f seconds\n", $COMPANY, scalar @{$devices}, $query_cs, $query_total);
+verbose 1, sprintf("%s: queried %d devices for %d ConfigSources in %.1f seconds\n", $COMPANY, $query_devices, $query_cs, $query_total);
 
 exit;
 

@@ -20,23 +20,18 @@ use warnings;
 #------------------------------------------------------------------------------
 
 # option defaults
-my $DRYRUN = 0;
 my $VERBOSE = 0;
 my $COMPANY;
 
 Getopt::Long::Configure ("bundling");
 
 GetOptions(
-    "dryrun|n"		=> \$DRYRUN,
     "verbose|v+"	=> \$VERBOSE,
+    "trace|t=i"		=> \$WM::LMAPI::TRACE,
     "company|c=s"	=> \$COMPANY,
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
-
-if ($DRYRUN) {
-    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
-}
 
 sub verbose ($@) {
     my $minverbose = shift;

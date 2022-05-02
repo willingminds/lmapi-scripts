@@ -41,6 +41,15 @@ use Data::Dumper;
 use strict;
 use warnings;
 
+our $TRACE  = 0;
+our $DRYRUN = 0;
+
+#------------------------------------------------------------------------------
+sub trace ($@) {
+    my $mintrace = shift;
+    print "TRACE: " . join("", @_) if $TRACE >= $mintrace;
+}
+
 #------------------------------------------------------------------------------
 
 sub new {
@@ -61,6 +70,15 @@ sub initialize {
     my $self = shift;
     my %opts = @_;
     $opts{credfile} ||= "$ENV{HOME}/.lmapi";
+
+    if ($opts{trace}){
+	$TRACE = $opts{trace};
+    }
+    trace(1, "Trace level set to $TRACE\n");
+    if ($opts{dryrun}){
+	$DRYRUN = $opts{dryrun};
+    }
+    warn "LMAPI: DRYRUN is ON -- No changes will be committed to LogicMonitor\n" if $DRYRUN;
 
     croak "ERROR: missing required argument 'company'\n" if not defined $opts{company};
     my $company = $opts{company};
@@ -142,15 +160,20 @@ sub get_all {
 		$offset += $fetchsize;
 	    }
 	    else {
-		croak "$self->{company}: get_all(@{[Data::Dumper->Dump([\%args], [qw(args)])]}): $json->{status} $json->{errmsg}\n";
+		# if ANY intermediate call fails, invalidate the entire collection
+		$self->_condbail($json,\%args);
+		$items = [];
+		last;
 	    }
 	}
 	else {
-	    # no results
+	    # Shouldn't ever get here. The call to _get() should always return a 
+	    # hash with status.  If we do somehow get here, invalidate collection 
+	    # because who knows what state it's in.
+	    $items = [];
 	    last;
 	}
     }
-
     return $items;
 }
 
@@ -185,38 +208,63 @@ sub get_data_nonpaged {
 	    }
 	}
 	else {
-	    croak "$self->{company}: get_data: $json->{status} $json->{errmsg}\n" unless
-		$json->{status} == 1007		# Such datapoints([XXX]) do not belong to current datasource(ID=NNN).
-	     or $json->{status} == 1069;	# device<NNN> has no such DeviceDataSource
+	    $self->_condbail($json, \%args);
 	}
     }
 
     return $items;
 }
 
+sub _condbail {
+    my $self = shift;
+    my $json = shift;
+    my $args = shift;
+
+    if ($json->{status} == 1007	or	# Such datapoints([XXX]) do not belong to current datasource(ID=NNN).
+        $json->{status} == 1069) {	# device<NNN> has no such DeviceDataSource
+	# no action, this should just result in an undef result
+    }
+    else {
+	my $request_data = "";
+	if ($self->{_last_request}) {
+	     $request_data = "\nraw request:\n" . $self->{_last_request}->as_string;
+	}
+	croak "$self->{company}: get_all(@{[Data::Dumper->Dump([$args], [qw(args)])]}): $json->{status} $json->{errmsg}$request_data\n";
+    }
+}
+
 sub _jsonitems {
     my $json = shift;
     my $items;
 
-    if (exists $json->{data}->{items}) {
-	if (ref $json->{data}->{items} eq 'ARRAY' and @{$json->{data}->{items}}) {
-	    push(@$items, @{$json->{data}->{items}});
+    if (exists $json->{data} and ref $json->{data} eq 'HASH') {
+	if (exists $json->{data}->{items}) {
+	    # v1, items key
+	    if (ref $json->{data}->{items} eq 'ARRAY' and @{$json->{data}->{items}}) {
+		push(@$items, @{$json->{data}->{items}});
+	    }
+	    elsif (ref $json->{data}->{items} eq 'HASH') {
+		push(@$items, $json->{data}->{items});
+	    }
 	}
-	elsif (ref $json->{data}->{items} eq 'HASH') {
-	    push(@$items, $json->{data}->{items});
-	}
-    }
-    elsif (exists $json->{items}) {
-	if (ref $json->{items} eq 'ARRAY' and @{$json->{items}}) {
-	    push(@$items, @{$json->{items}});
-	}
-	elsif (ref $json->{items} eq 'HASH') {
-	    push(@$items, $json->{items});
-	}
-    }
-    elsif (exists $json->{data}) {
-	if (ref $json->{data} eq 'HASH') {
+	else {
+	    # v1, no items key
 	    push(@$items, $json->{data});
+	}
+    }
+    else {
+	if (exists $json->{items}) {
+	    # v2+, items key
+	    if (ref $json->{items} eq 'ARRAY' and @{$json->{items}}) {
+		push(@$items, @{$json->{items}});
+	    }
+	    elsif (ref $json->{items} eq 'HASH') {
+		push(@$items, $json->{items});
+	    }
+	}
+	else {
+	    # v2+, no items key
+	    push(@$items, $json);
 	}
     }
 
@@ -233,27 +281,126 @@ sub _version {
     }
     else {
 	my $path = $opts{'path'};
-	if ($path =~ m:^(/setting/netscans/|/device/devices/\d+/flows|/setting/alert/internalalerts|/debug$):) {
-	    $version = 2;
-	}
-	elsif ($path =~ m:^/setting/(role|admin)/groups:) {
+	if ($path =~ m{^/setting/(role|admin)/groups}) {
 	    $version = 3;
 	}
-	elsif ($path =~ m:^/setting/(oids|functions|configsources|eventsources|propertyrules|batchjobs|topologysources|registry|alert/dependencyrules)\b:) {
+	elsif ($path =~ m{^/setting/(oids|functions|configsources|eventsources|propertyrules|batchjobs|topologysources|registry|alert/(dependencyrules|rules)|companySetting|accesslogs)\b}) {
 	    $version = 3;
 	}
-	elsif ($path =~ m:^(/device/unmonitoreddevices)$:) {
+	elsif ($path =~ m{^/device/unmonitoreddevices$}) {
 	    $version = 3;
 	}
-	elsif ($path =~ m:^(/website/websites)$:) {
+	elsif ($path =~ m{^/website/}) {
 	    $version = 3;
+	}
+	elsif ($path =~ m{^/service/(services|groups)$}) {
+	    $version = 1;
+	}
+	elsif ($path =~ m{^/service/(services|groups)/\d+/properties$}) {
+	    $version = 1;
+	}
+	elsif ($path =~ m{^/device/(devices|groups)/\d+/properties$}) {
+	    $version = 1;
+	}
+	elsif ($path =~ m{^/device/devices/\d+/devicedatasources$}) {
+	    $version = 1;
+	}
+	elsif ($path =~ m{^/setting/collectors(/\d+)?$}) {
+	    $version = 1;
 	}
 	else {
-	    $version = 1;
+	    $version = 2;
 	}
     }
 
     return $version;
+}
+
+# internal method to handle request and return data.
+# handles rate-limiting.
+sub _do_request {
+    my $self = shift;
+    my %opts = @_;
+
+    my $raw = 0;
+    $raw = $opts{'raw'} if defined $opts{'raw'};
+
+    my $req = $opts{request};
+    my $url = $opts{url};
+    my $timeout = $opts{'timeout'};
+    trace(3, "Raw request:\n" . $req->as_string . "\n");
+    if ($opts{modifies} and $DRYRUN){
+	warn "LMAPI: DRYRUN -- Request is:\n",
+	     "        URL: ", $url, "\n",
+	     "    Content: ", $req->content, "\n";
+	return({ status => 'OK', message => 'DRYRUN' });
+    }
+
+    my $ua = LWP::UserAgent->new();
+    $ua->timeout($timeout) if defined $timeout;
+
+    my $retries = 0;
+    my $max_retries = 3;  # maybe make this a parameter to _do_request()?
+    while (1) {
+	#
+	# Stash the request object in case we need to dump it later due to errors
+	#
+	$self->{_last_request} = $req;
+	if (my $response = $ua->request( $req )) {
+	    if ($response->is_success) {
+		trace(9, "response data:\n", $response->content);
+		my $hash = from_json($response->content);
+		if ($raw) {
+		    $hash->{json} = $response->content;
+		}
+		$hash->{status} = $response->code unless defined $hash->{status};
+		return $hash;
+	    }
+	    elsif ($response->status_line =~ /^429\s/ and $response->header('X-Rate-Limit-Remaining') == 0) {
+		my $window = $response->header('X-Rate-Limit-Window');
+		if (defined $window and $window > 0) {
+		    trace(1, "Sleeping for $window seconds due to rate-limit\n");
+		    sleep($window);
+		}
+	    }
+	    elsif ($response->code == 400 or $response->code == 404) {
+		# should have response data with more details
+		my $r_code = $response->code;
+		my $content = from_json($response->content);
+		if (ref($content) eq 'HASH' and $content->{errorMessage}){
+		    return { status => $r_code, errmsg => $content->{errorMessage} };
+		}
+		else {
+		    return { status => $r_code, errmsg => $response->status_line };
+		}
+	    }
+	    elsif ($response->status_line =~ /^500\s/ and $response->content =~ /LMAPI fetch exceeded \d+ seconds/) {
+		# retry on timeouts
+		$retries++;
+		if ($retries > $max_retries){
+		    carp "Request timed out after $max_retries retries -- giving up.\n";
+		    return { status => 500, errmsg => $response->status_line };
+		}
+		else {
+		    carp "Request timed out -- attempting retry $retries\n";
+		    next;
+		}
+	    }
+	    else {
+		carp "Problem with request:\n", 
+		     "    Request: $url\n", 
+		     "    Response Status: ", $response->status_line . "\n",
+		     "    Response Content ", $response->content . "\n";
+		trace(3, Dumper($response));
+		return { status => 500, errmsg => $response->status_line };
+	    }
+	}
+    }
+
+    carp "Problem with request:\n", 
+	 "    Request: $url\n", 
+	 "    Response Status: TIMEOUT\n";
+    return { status => 500, errmsg => "Request timed out" };
 }
 
 # internal method, used by get_all to deal with paging
@@ -264,11 +411,9 @@ sub _get {
 
     my $path = $opts{'path'};
 
-    my $raw = 0;
-    $raw = $opts{'raw'} if defined $opts{'raw'};
-
     # set explicit version, or implicitly for known v2-only paths
     my $version = $self->_version(%opts);
+    delete $opts{version};
 
     for my $prop (qw(size sort filter fields offset format period datapoints)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
@@ -278,7 +423,6 @@ sub _get {
     my $auth = $self->lmapiauth(method => 'GET', %opts);
     
     # setup HTTP agent and headers
-    my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
     my @headers = (
@@ -290,31 +434,9 @@ sub _get {
     if ($version > 1) {
 	push(@headers, "X-version" => "$version");
     }
-    while (1) {
-	my $req = GET $url, @headers;
-	if (my $response = $ua->request( $req )) {
-	    if ($response->is_success) {
-		my $hash = from_json($response->content);
-		if ($raw){
-		    $hash->{json} = $response->content;
-		}
-		$hash->{status} = $response->code unless defined $hash->{status};
-		return $hash;
-	    }
-	    elsif ($response->status_line =~ /^429\s/ and $response->header('X-Rate-Limit-Remaining') == 0) {
-		my $window = $response->header('X-Rate-Limit-Window');
-		if (defined $window and $window > 0) {
-		    sleep($window);
-		}
-	    }
-	    else {
-		carp "Problem with request:\n", 
-		     "    Request: $url\n", 
-		     "    Response Status: ", $response->status_line . "\n";
-		return undef;
-	    }
-	}
-    }
+    my $req = GET $url, @headers;
+
+    return $self->_do_request(%opts, request => $req, url => $url);
 }
 
 sub put {
@@ -327,6 +449,7 @@ sub put {
 
     # set explicit version, or implicitly for known v2-only paths
     my $version = $self->_version(%opts);
+    delete $opts{version};
 
     for my $prop (qw(_scope collectorId)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
@@ -335,8 +458,6 @@ sub put {
     # construct authorization string
     my $auth = $self->lmapiauth(method => 'PUT', %opts);
 
-    # setup HTTP agent and headers
-    my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
     my @headers = (
@@ -349,17 +470,8 @@ sub put {
     }
 
     my $req = PUT $url, @headers;
-    if (my $response = $ua->request( $req )) {
-	if ($response->is_success) {
-	    return from_json($response->content);
-	}
-	else {
-	    carp "Problem with request:\n", 
-		 "    Request: $url\n", 
-		 "    Response Status: ", $response->status_line . "\n";
-	    return undef;
-	}
-    }
+
+    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
 }
 
 sub post {
@@ -369,9 +481,10 @@ sub post {
 
     my $path = $opts{'path'};
     my $content = $opts{'content'};
-    #
+    
     # set explicit version, or implicitly for known v2-only paths
     my $version = $self->_version(%opts);
+    delete $opts{version};
 
     for my $prop (qw(_scope collectorId)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
@@ -380,8 +493,6 @@ sub post {
     # construct authorization string
     my $auth = $self->lmapiauth(method => 'POST', %opts);
 
-    # setup HTTP agent and headers
-    my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
     my @headers = (
@@ -394,17 +505,8 @@ sub post {
     }
 
     my $req = POST $url, @headers;
-    if (my $response = $ua->request( $req )) {
-	if ($response->is_success) {
-	    return from_json($response->content);
-	}
-	else {
-	    carp "Problem with request:\n", 
-		 "    Request: $url\n", 
-		 "    Response Status: ", $response->status_line . "\n";
-	    return undef;
-	}
-    }
+
+    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
 }
 
 sub patch {
@@ -414,9 +516,10 @@ sub patch {
 
     my $path = $opts{'path'};
     my $content = $opts{'content'};
-    #
+    
     # set explicit version, or implicitly for known v2-only paths
     my $version = $self->_version(%opts);
+    delete $opts{version};
 
     for my $prop (qw(_scope collectorId patchFields)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
@@ -426,7 +529,6 @@ sub patch {
     my $auth = $self->lmapiauth(method => 'PATCH', %opts);
 
     # setup HTTP agent and headers
-    my $ua = LWP::UserAgent->new();
     my $url = $self->{baseurl} . $path;
     $url .= sprintf("?%s", join('&', @args)) if @args;
     my @headers = (
@@ -440,17 +542,8 @@ sub patch {
     # LWP versions currently deployed don't natively support
     # HTTP 'PATCH'.
     my $req = HTTP::Request->new('PATCH', $url, \@headers, $content);
-    if (my $response = $ua->request( $req )) {
-	if ($response->is_success) {
-	    return from_json($response->content);
-	}
-	else {
-	    carp "Problem with request:\n", 
-		 "    Request: $url\n", 
-		 "    Response Status: ", $response->status_line . "\n";
-	    return undef;
-	}
-    }
+
+    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
 }
 
 sub lmapiauth {

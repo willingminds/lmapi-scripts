@@ -48,25 +48,27 @@ use warnings;
 #------------------------------------------------------------------------------
 
 # option defaults
-my $DRYRUN = 0;
 my $VERBOSE = 0;
 my $COMPANY;
 my $CHECKPEERS;
+my @DEVICES;
 
 Getopt::Long::Configure ("bundling");
 
 GetOptions(
-    "dryrun|n"		=> \$DRYRUN,
+    "dryrun|n"		=> \$WM::LMAPI::DRYRUN,
     "verbose|v+"	=> \$VERBOSE,
+    "trace|t=i"		=> \$WM::LMAPI::TRACE,
     "company|c=s"	=> \$COMPANY,
+    "device|D=s"	=> \@DEVICES,
     "checkpeers!"	=> \$CHECKPEERS,
 ) or die;
 
 die "ERROR: must define company\n" if not defined($COMPANY);
 
-if ($DRYRUN) {
-    warn "DRY RUN MODE: NO CHANGES WILL BE COMMITTED TO LM API VIA PUT\n";
-}
+push @DEVICES, @ARGV if @ARGV;
+
+my %DEVICEINCLUDE = map { lc $_ => 1 } @DEVICES;
 
 sub verbose ($@) {
     my $minverbose = shift;
@@ -124,7 +126,9 @@ if ($@) {
 
 DEVICE:
 for my $d (@{$devices}) {
-    verbose 2, "working on $d->{displayName}\n";
+    my $devicename = $d->{displayName};
+    next DEVICE if (@DEVICES and not $DEVICEINCLUDE{lc $devicename});
+    verbose 2, "working on $devicename\n";
     ##alarm(30);
     
     # extract custom monitoring/alerting properties (assigned to devices directly or inherited)
@@ -140,18 +144,39 @@ for my $d (@{$devices}) {
 	$deviceproperties = $lmapi->get_all(path => "/device/devices/$d->{id}/properties");
     };
     if ($@) {
-	warn "$COMPANY: $d->{displayName}: unable to load device properties\n$@\n";
+	warn "$COMPANY: $devicename: unable to load device properties\n$@\n";
 	next DEVICE;
     }
 
     if (ref($deviceproperties) eq 'ARRAY') {
-	for my $p (grep { $_->{name} =~ /^wm\.intf\./ } @{$deviceproperties}) {
-	    if ($p->{value} eq "null") {
-		# hack to remove a property since LM has no method to do this (yet)
-		delete $propvals{$p->{name}};
+	for my $p (@{$deviceproperties}) {
+	    if ($p->{name} =~ /^wm\.intf\./) {
+		if ($p->{value} eq "null") {
+		    # hack to remove a property since LM has no method to do this (yet)
+		    delete $propvals{$p->{name}};
+		}
+		else {
+		    $propvals{$p->{name}} = $p->{value};
+		}
 	    }
-	    else {
-		$propvals{$p->{name}} = $p->{value};
+	    elsif ($p->{name} eq "system.categories") {
+		# don't bother with non-SNMP and non-Meraki devices (may need to expand category list for API-based devices)
+		my %desired_category = ( 
+		    snmp             => 1,
+		    MerakiAPINetwork => 1,
+		);
+		my $wanted = 0;
+		CATCHECK:
+		for my $cat ( split(/,/, $p->{value}) ) {
+		    if ($desired_category{$cat}){
+			$wanted = 1;
+			last CATCHECK;
+		    }
+		}
+		if (not $wanted) {
+		    verbose 2, "skipping non-desired device $devicename\n";
+		    next DEVICE;
+		}
 	    }
 	}
     }
@@ -172,17 +197,30 @@ for my $d (@{$devices}) {
     }
 
     # get a list of all interface datasources (WIP: hardcoded pattern for now)
-    my $devicedatasources;
+    my @devicedatasources;
+    
+    # 
+    # Get the old snmp*If and new SNMP_Network_Interfaces* datasources
+    # 
     eval {
-	$devicedatasources = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources", filter => 'dataSourceName~snmp*If');
+	# LM broke filters somehow, doing it the hard way, but at least just one overall call.
+	@devicedatasources = grep { 
+	    $_->{dataSourceName} =~ /
+		^snmp.*If |
+		^SNMP_Network_Interfaces |
+		^Cisco_Meraki_Switch_Interfaces |
+		^Fortinet_FortiGate_Interfaces
+	    /x }
+	    @{$lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources", fields => 'id,dataSourceName')};
     };
     if ($@) {
-	warn "$COMPANY: $d->{displayName}: unable to load device interfaces\n$@\n";
+	warn "$COMPANY: $devicename: unable to load device interface datasources\n$@\n";
 	next DEVICE;
     }
 
     DATASOURCE:
-    for my $ds (@{$devicedatasources}) {
+    for my $ds (@devicedatasources) {
+	my $ds_name = $ds->{dataSourceName};
 	my $peer_data;
 	if (@peerdevices) {
 	    for my $id ($d->{id}, map { $_->{id} } @peerdevices) {
@@ -197,27 +235,45 @@ for my $d (@{$devices}) {
 	}
 
 	# get a list of all instances for this DS
-	my $devicedatasourceinstances = $lmapi->get_all(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances");
+	my $instances_path = "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances";
+	my $devicedatasourceinstances = $lmapi->get_all(path => $instances_path);
 
 	INSTANCE:
 	for my $dsi (@{$devicedatasourceinstances}) {
+	    my $dsiname = $dsi->{displayName};
 
-	    my $put_data = {
-	       	groupId => $dsi->{groupId},
-		displayName => $dsi->{displayName},
-	       	description => $dsi->{description},
-	       	wildValue => $dsi->{wildValue},
-	       	disableAlerting => $dsi->{disableAlerting},
-	       	stopMonitoring => $dsi->{stopMonitoring},
-	    };
-	    my $commit_needed = 0;
+	    my $patch_data = {};
 
 	    my $alert = ($propvals{'wm.intf.desc.alert'} || '');
 	    my $noalert = ($propvals{'wm.intf.desc.noalert'} || '');
 	    my $monitor = ($propvals{'wm.intf.desc.monitor'} || '');
 	    my $nomonitor = ($propvals{'wm.intf.desc.nomonitor'} || '');
 
-	    verbose 2, "working on $d->{displayName}:$dsi->{displayName} ($dsi->{description})\n";
+	    #
+	    # For the SNMP_Network_Interfaces datasource, instance names include the SNMP ifIndex value, for example:
+	    #    
+	    #    GigabitEthernet0/0.10 [ID:69]
+	    #
+	    # and the instance description is variable.  If there is an SNMP ifAlias value, it will be:
+	    #    <ifAlias> - <ifDescr> - <mac addr>
+	    #
+	    #    i.e.: FountainValley Data Vlan - GigabitEthernet0/0.10 - e0:2f:6d:de:ba:10
+	    #
+	    # If there is no ifAlias value, it will be:
+	    #    <ifDescr> - <mac addr>
+	    #   
+	    # So, we'll strip the ifDescr and MAC address from the instance description before matching
+	    # the various patterns.
+	    #
+	    my $description = $dsi->{description};
+	    if ($ds_name =~ /^SNMP_Network_Interface/){
+		verbose 3, "$devicename: Modifying $ds_name instance $dsiname description - OLD: $description\n";
+		$description =~ s/\S+\s+-\s+([a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}\s*$//;
+		# now it will either be empty or have the ifAlias followed by ' - '
+		$description =~ s/\s+-\s+$//;
+		verbose 3, "$devicename: Modifying $ds_name instance $dsiname description - NEW: $description\n";
+	    }
+	    verbose 2, "working on $devicename:$ds_name:$dsiname ($description)\n";
 	    verbose 3, "     alert: '$alert'\n";
 	    verbose 3, "   noalert: '$noalert'\n";
 	    verbose 3, "   monitor: '$monitor'\n";
@@ -225,45 +281,40 @@ for my $d (@{$devices}) {
 
 	    # determine if this instance should have alerting enabled or disabled
 	    my $disableAlerting;
-	    if ($alert and $dsi->{description} =~ /$alert/) {
+	    if ($alert and $description =~ /$alert/) {
 		verbose 3, "alert condition matched, disableAlerting -> false\n";
 		$disableAlerting = JSON::false;
 	    }
-	    if ($noalert and $dsi->{description} =~ /$noalert/) {
+	    if ($noalert and $description =~ /$noalert/) {
 		verbose 3, "noalert condition matched, disableAlerting -> true\n";
 		$disableAlerting = JSON::true;
 	    }
 	    if (defined($disableAlerting) and $dsi->{disableAlerting} != $disableAlerting) {
-		$put_data->{disableAlerting} = $disableAlerting;
-		$commit_needed = 1;
+		$patch_data->{disableAlerting} = $disableAlerting;
 	    }
 
 	    # determine if this instance should have monitoring enabled or disabled
 	    my $stopMonitoring;
-	    if ($monitor and $dsi->{description} =~ /$monitor/) {
+	    if ($monitor and $description =~ /$monitor/) {
 		verbose 3, "monitor condition matched, stopMonitoring -> false\n";
 		$stopMonitoring = JSON::false;
 	    }
-	    if ($nomonitor and $dsi->{description} =~ /$nomonitor/) {
+	    if ($nomonitor and $description =~ /$nomonitor/) {
 		verbose 3, "nomonitor condition matched, stopMonitoring -> true\n";
 		$stopMonitoring = JSON::true;
 	    }
 	    if (defined($stopMonitoring) and $dsi->{stopMonitoring} != $stopMonitoring) {
-		$put_data->{stopMonitoring} = $stopMonitoring;
-		$commit_needed = 1;
+		$patch_data->{stopMonitoring} = $stopMonitoring;
 	    }
 
 	    # commit changes to LM API if needed
-	    if ($commit_needed) {
+	    if (%{$patch_data}) {
+		my $patch_fields = join(",", sort keys %{$patch_data});
 		###WIP: add this to the report for wm.intf.email.* targets in scope
-		my $content = to_json($put_data);
-		verbose 1, "committing change to $d->{displayName}:$dsi->{displayName}:\n\t$content\n";
-		if ($DRYRUN) {
-		    print qq(put(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances/$dsi->{id}", content => $content)\n);
-		}
-		else {
-		    $lmapi->put(path => "/device/devices/$d->{id}/devicedatasources/$ds->{id}/instances/$dsi->{id}", content => $content);
-		}
+		my $patch_path = "$instances_path/$dsi->{id}";
+		my $content = to_json($patch_data);
+		verbose 1, "committing change to $devicename:$dsiname:\n\t$content\n";
+		$lmapi->patch(path => $patch_path, content => $content, patchFields => $patch_fields);
 	    }
 	}
     }
