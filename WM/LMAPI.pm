@@ -36,6 +36,8 @@ use YAML ();
 use Time::HiRes qw(time);
 use Digest::SHA qw(hmac_sha256_hex);
 use MIME::Base64 ();
+use Scalar::Util qw(reftype);
+use URI::Escape;
 use Data::Dumper;
 
 use strict;
@@ -71,11 +73,11 @@ sub initialize {
     my %opts = @_;
     $opts{credfile} ||= "$ENV{HOME}/.lmapi";
 
-    if ($opts{trace}){
+    if ($opts{trace}) {
 	$TRACE = $opts{trace};
     }
     trace(1, "Trace level set to $TRACE\n");
-    if ($opts{dryrun}){
+    if ($opts{dryrun}) {
 	$DRYRUN = $opts{dryrun};
     }
     warn "LMAPI: DRYRUN is ON -- No changes will be committed to LogicMonitor\n" if $DRYRUN;
@@ -135,9 +137,26 @@ sub get_all {
     while (1) {
 	my $fetchsize = ((defined($maxitems) and $maxitems < $pagesize) ? $maxitems : $pagesize);
 	if (my $json = $self->_get(%args, size => $fetchsize, offset => $offset)) {
-	    if ($json->{status} == 200) {
+	    my $apiversion = $self->_version(%args);
+	    my $errorCode;
+	    if ($apiversion < 2 and $json->{status} != 200) {
+		$errorCode = $json->{status};
+	    }
+	    elsif (defined $json->{errorCode}) {
+		$errorCode = $json->{errorCode};
+	    }
+	    elsif (defined $json->{errmsg} and lc $json->{errmsg} ne 'ok') {
+		$errorCode = $json->{status};	# hack to workaround API bug (errorCode not always generated as documented)
+	    }
+	    if (defined $errorCode) {
+		# if ANY intermediate call fails, invalidate the entire collection
+		$self->_condbail($apiversion,$errorCode,$json,\%args);
+		$items = [];
+		last;
+	    }
+	    else {
 		if (my $jsonitems = _jsonitems($json)) {
-		    if ($raw){
+		    if ($raw) {
 			push (@$items, $json->{json});
 		    }
 		    else {
@@ -158,12 +177,6 @@ sub get_all {
 		    }
 		}
 		$offset += $fetchsize;
-	    }
-	    else {
-		# if ANY intermediate call fails, invalidate the entire collection
-		$self->_condbail($json,\%args);
-		$items = [];
-		last;
 	    }
 	}
 	else {
@@ -191,24 +204,44 @@ sub get_data_nonpaged {
 	$stime = $etime - (3600 * $args{period});
     }
     else {
-	$etime = $args{start};
-	$stime = $args{end};
+	$stime = $args{start};
+	$etime = $args{end};
     }
-    croak "$self->{company}: get_data: start time not defined" unless defined $stime;
-    croak "$self->{company}: get_data: end time not defined" unless defined $etime;
-    croak "$self->{company}: get_data: time warp (start after end)" if $stime > $etime;
-    $stime *= 1000;
-    $etime *= 1000;
+    croak $self->company, ": get_data: start time not defined" unless defined $stime;
+    croak $self->company, ": get_data: end time not defined" unless defined $etime;
+    croak $self->company, ": get_data: time warp: start '$stime' is after end '$etime'" if $stime > $etime;
+    #
+    # Oddly, at least for data from /website/websites, start and end are regular Unix epoch values
+    # even though the data returned in in millisecond epoch values.
+    #
+    #$stime *= 1000;
+    #$etime *= 1000;
 
     # get one page of data, ignore the rest
     if (my $json = $self->_get(%args, start => $stime, end => $etime)) {
-	if ($json->{status} == 200) {
-	    if (my $jsonitems = _jsonitems($json)) {
-		push(@$items, @{$jsonitems});
-	    }
+	my $apiversion = $self->_version(%args);
+	my $errorCode;
+	if ($apiversion < 2 and $json->{status} != 200) {
+	    $errorCode = $json->{status};
+	}
+	elsif (defined $json->{errorCode}) {
+	    $errorCode = $json->{errorCode};
+	}
+	elsif (defined $json->{errmsg} and length $json->{errmsg}) {
+	    $errorCode = $json->{status};	# hack to workaround API bug (errorCode not always generated as documented)
+	}
+	if (defined $errorCode) {
+	    # if ANY intermediate call fails, invalidate the entire collection
+	    $self->_condbail($apiversion,$errorCode,$json,\%args);
+	    $items = [];
+	    last;
 	}
 	else {
-	    $self->_condbail($json, \%args);
+	    if ($json->{status} == 200) {
+		if (my $jsonitems = _jsonitems($json)) {
+		    push(@$items, @{$jsonitems});
+		}
+	    }
 	}
     }
 
@@ -217,20 +250,27 @@ sub get_data_nonpaged {
 
 sub _condbail {
     my $self = shift;
+    my $apiversion = shift;
+    my $errorCode = shift;
     my $json = shift;
     my $args = shift;
 
-    if ($json->{status} == 1007	or	# Such datapoints([XXX]) do not belong to current datasource(ID=NNN).
-        $json->{status} == 1069) {	# device<NNN> has no such DeviceDataSource
-	# no action, this should just result in an undef result
+    if ($apiversion == 1) {
+	if ($json->{status} == 1007	or	# Such datapoints([XXX]) do not belong to current datasource(ID=NNN).
+	    $json->{status} == 1069) {	# device<NNN> has no such DeviceDataSource
+	    # no action, this should just result in an undef result
+	    return;
+	}
     }
     else {
-	my $request_data = "";
-	if ($self->{_last_request}) {
-	     $request_data = "\nraw request:\n" . $self->{_last_request}->as_string;
-	}
-	croak "$self->{company}: get_all(@{[Data::Dumper->Dump([$args], [qw(args)])]}): $json->{status} $json->{errmsg}$request_data\n";
+	return if $errorCode == 404;
     }
+
+    my $request_data = "";
+    if ($self->{_last_request}) {
+	 $request_data = "\nraw request:\n" . $self->{_last_request}->as_string;
+    }
+    croak "$self->{company}: get_all(@{[Data::Dumper->Dump([$args], [qw(args)])]}): $json->{status} $json->{errmsg}$request_data\n";
 }
 
 sub _jsonitems {
@@ -293,6 +333,9 @@ sub _version {
 	elsif ($path =~ m{^/website/}) {
 	    $version = 3;
 	}
+	elsif ($path =~ m{^/dashboard/widgets}) {
+	    $version = 3;
+	}
 	elsif ($path =~ m{^/service/(services|groups)$}) {
 	    $version = 1;
 	}
@@ -325,15 +368,20 @@ sub _do_request {
     my $raw = 0;
     $raw = $opts{'raw'} if defined $opts{'raw'};
 
+    my $version = $opts{'version'};
+    $version ||= 1;
+    my $status_field = $version == 1 ? "status" : "errorCode";
+
     my $req = $opts{request};
     my $url = $opts{url};
     my $timeout = $opts{'timeout'};
+    trace(7, "Request: " . localtime . "\n");
     trace(3, "Raw request:\n" . $req->as_string . "\n");
-    if ($opts{modifies} and $DRYRUN){
+    if ($opts{modifies} and $DRYRUN) {
 	warn "LMAPI: DRYRUN -- Request is:\n",
 	     "        URL: ", $url, "\n",
 	     "    Content: ", $req->content, "\n";
-	return({ status => 'OK', message => 'DRYRUN' });
+	return({ $status_field => 'OK', message => 'DRYRUN' });
     }
 
     my $ua = LWP::UserAgent->new();
@@ -348,12 +396,22 @@ sub _do_request {
 	$self->{_last_request} = $req;
 	if (my $response = $ua->request( $req )) {
 	    if ($response->is_success) {
-		trace(9, "response data:\n", $response->content);
+		if ($retries) {
+		    #
+		    # use warn instead of carp because we don't
+		    # need it to output the caller line number on success.
+		    #
+		    warn "retry $retries successful!\n";
+		}
+		trace(7, "Response: " . localtime . "\n");
+		trace(9, "response data:\n", $response->content, "\n");
 		my $hash = from_json($response->content);
 		if ($raw) {
 		    $hash->{json} = $response->content;
 		}
-		$hash->{status} = $response->code unless defined $hash->{status};
+		if ($version == 1 and not defined $hash->{$status_field}) {
+		    $hash->{$status_field} = $response->code;
+		}
 		return $hash;
 	    }
 	    elsif ($response->status_line =~ /^429\s/ and $response->header('X-Rate-Limit-Remaining') == 0) {
@@ -365,42 +423,80 @@ sub _do_request {
 	    }
 	    elsif ($response->code == 400 or $response->code == 404) {
 		# should have response data with more details
-		my $r_code = $response->code;
 		my $content = from_json($response->content);
-		if (ref($content) eq 'HASH' and $content->{errorMessage}){
-		    return { status => $r_code, errmsg => $content->{errorMessage} };
+		if (ref($content) eq 'HASH' and $content->{errmsg}) {
+		    return { $status_field => $response->code, errmsg => $content->{errmsg} };
 		}
 		else {
-		    return { status => $r_code, errmsg => $response->status_line };
+		    return { $status_field => $response->code, errmsg => $response->status_line };
 		}
 	    }
-	    elsif ($response->status_line =~ /^500\s/ and $response->content =~ /LMAPI fetch exceeded \d+ seconds/) {
-		# retry on timeouts
+	    elsif ($response->status_line =~ /^500\s/ and $response->header("Client-Warning") eq 'Internal response') {
+		# An error happened on this side of the connection such as an 
+		# alarm timer expiring or other handled signal.  Retry.
 		$retries++;
-		if ($retries > $max_retries){
-		    carp "Request timed out after $max_retries retries -- giving up.\n";
-		    return { status => 500, errmsg => $response->status_line };
+		if ($retries > $max_retries) {
+		    carp $self->company, ": Request had LMAPI failure after $max_retries retries -- giving up.\n";
+		    return { $status_field => 500, errmsg => $response->status_line };
 		}
 		else {
-		    carp "Request timed out -- attempting retry $retries\n";
+		    trace(7, "Internal error received: " . localtime . "\n");
+		    carp $self->company, ": Request had internal error -- attempting retry $retries\n";
+		    trace(3, "Response as-string:\n" . $response->as_string . "\n");
 		    next;
 		}
 	    }
 	    else {
-		carp "Problem with request:\n", 
+		carp $self->company, ": Problem with request:\n", 
 		     "    Request: $url\n", 
 		     "    Response Status: ", $response->status_line . "\n",
 		     "    Response Content ", $response->content . "\n";
 		trace(3, Dumper($response));
-		return { status => 500, errmsg => $response->status_line };
+		return { $status_field => 500, errmsg => $response->status_line };
 	    }
 	}
     }
 
-    carp "Problem with request:\n", 
+    carp $self->company, ": Problem with request:\n", 
 	 "    Request: $url\n", 
 	 "    Response Status: TIMEOUT\n";
-    return { status => 500, errmsg => "Request timed out" };
+    return { $status_field => 500, errmsg => "Request timed out" };
+}
+
+# internal function.  Makes sure filter expressions are properly URI-encoded.
+sub _encode_filter_expr {
+    my %opts = @_;
+    my $attr = $opts{attr};
+    my $expr = $opts{expr};
+    #
+    # Any '+' characters need to be double-encoded so just replace them
+    # with '%252B'
+    #
+    $expr =~ s/\+/%252B/g;
+
+    #
+    # Any '\' characters need to be doubled and encoded so replace them with
+    # '%5C%5C'
+    #
+    $expr =~ s/\\/%5C%5C/g;
+
+    # If we're using API v2 (or later, presumably) any string-type attributes
+    # need their expressions to be quoted, so do so unless they are already
+    # quoted.  This list will need to be expanded.
+    my @string_attrs = qw( displayName fullPath dataPointName instanceDescription );
+
+    STR:
+    for my $str (@string_attrs) {
+	if ($attr =~ /^$str/) {
+	    $expr = qq{"$expr"} unless ($expr =~ /^".*"$/);
+	    #
+	    # Make sure any special characters (&, -, etc.) get handled.
+	    #
+	    $expr = uri_escape($expr);
+	    last STR;
+	}
+    }
+    return($expr);
 }
 
 # internal method, used by get_all to deal with paging
@@ -415,7 +511,68 @@ sub _get {
     my $version = $self->_version(%opts);
     delete $opts{version};
 
-    for my $prop (qw(size sort filter fields offset format period datapoints)) {
+    # Handle filters separately and try to handle the special cases
+    #   see: https://communities.logicmonitor.com/topic/7763-api-filtering-info/
+    if ($opts{filter}) {
+	my $pre_filter = $opts{filter};
+	my $filter;
+	if (not defined reftype($pre_filter)) {
+	    #
+	    # If passed a scalar, assume the caller knows what they're doing and
+	    # just use it as-is.  If passed a ref, then handle it specially.
+	    #
+	    $filter = $pre_filter;
+	}
+	elsif (reftype($pre_filter) eq 'HASH') {
+	    #
+	    # If passed as a hashref, the keys should be the attribute and operation 
+	    # and the value should be the expression.  For example:
+	    #
+	    #     { 'cleared:' => 'true', 'displayName~' => 'esxi' }
+	    #
+	    my @filters = ();
+	    for my $attr (sort keys %$pre_filter) {
+		my $expr = _encode_filter_expr(attr => $attr, expr => $pre_filter->{$attr});
+		push @filters, qq{$attr$expr};
+	    }
+
+	    $filter = join(',', @filters);
+	}
+	elsif (reftype($pre_filter) eq 'ARRAY') {
+	    #
+	    # If passed as an arrayref, it should be an array of arrayrefs and hashrefs.
+	    # The arrayrefs should be 3-element arrays in the order: attribute, operation, expression
+	    # The hashrefs should have 3 keys: attr, op and expr.
+	    # Both arrayrefs and hashrefs can be included.  For example:
+	    #
+	    #   [ [ 'cleared', ':', 'true' ], { attr => 'displayName', op => '~', expr => 'esxi' } ]
+	    # 
+	    my @filters = ();
+	    for my $f (@$pre_filter) {
+		my $attr = "";
+		my $op   = "";
+		my $expr = "";
+		if (reftype($f) eq 'ARRAY') {
+		    ($attr, $op, $expr) = @$f;
+		}
+		elsif (reftype($f) eq 'HASH') {
+		    ($attr, $op, $expr) = @{$f}{'attr', 'op', 'expr'};
+		}
+		else {
+		    # if it's anything else, just use it verbatim.
+		    $attr = $f;
+		}
+		$expr = _encode_filter_expr(attr => $attr, expr => $expr);
+		push @filters, qq{$attr$op$expr};
+	    }
+	    $filter = join(',', @filters);
+	}
+
+	push(@args, qq{filter=$filter}) if $filter;
+    }
+	
+    
+    for my $prop (qw(size sort fields offset format period datapoints start end)) {
         push(@args, "$prop=$opts{$prop}") if $opts{$prop};
     }
 
@@ -436,7 +593,7 @@ sub _get {
     }
     my $req = GET $url, @headers;
 
-    return $self->_do_request(%opts, request => $req, url => $url);
+    return $self->_do_request(%opts, version => $version, request => $req, url => $url);
 }
 
 sub put {
@@ -471,7 +628,7 @@ sub put {
 
     my $req = PUT $url, @headers;
 
-    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
+    return $self->_do_request(%opts, version => $version, request => $req, url => $url, modifies => 1);
 }
 
 sub post {
@@ -506,7 +663,7 @@ sub post {
 
     my $req = POST $url, @headers;
 
-    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
+    return $self->_do_request(%opts, version => $version, request => $req, url => $url, modifies => 1);
 }
 
 sub patch {
@@ -543,7 +700,7 @@ sub patch {
     # HTTP 'PATCH'.
     my $req = HTTP::Request->new('PATCH', $url, \@headers, $content);
 
-    return $self->_do_request(%opts, request => $req, url => $url, modifies => 1);
+    return $self->_do_request(%opts, version => $version, request => $req, url => $url, modifies => 1);
 }
 
 sub lmapiauth {

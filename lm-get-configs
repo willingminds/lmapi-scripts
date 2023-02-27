@@ -313,13 +313,39 @@ for my $device (@$devices) {
 					warn "ERROR: $dirname/$label: $c->{config}\n";
 					next INSTANCE;
 				    }
+
+				    # yet more unhandled exceptions by the excellent programmers at LM
+				    if ($c->{config} =~ /^Failed to send authorization REQUEST packet to the TACACS\+ server/smig) {
+					warn "ERROR: $dirname/$label: $c->{config}\n";
+					next INSTANCE;
+				    }
+				    if ($c->{config} =~ /^Not authorized to run this command/smig) {
+					warn "ERROR: $dirname/$label: $c->{config}\n";
+					next INSTANCE;
+				    }
 				    
-				    # Strip out "Startup Configuration: <d>" lines.  The numbers seem
+				    # Strip out "Startup Configuration: <d>" lines. The numbers seem
 				    # to increment when there are no other changes.
 				    $c->{config} =~ s/^Startup Configuration: \d+\s*$//smig;
 				    
 				    # Strip ephemeral authorization line since LM can't write gud kode
 				    $c->{config} =~ s/^Attempting to authorize\.+\s*$//smig;
+				}
+				elsif ($configSourceName eq "Microsoft_ActiveDirectory_PasswordPolicy") {
+				    # The LM PowerShell script sometimes fails without any explicit 
+				    # error, just bad data. Check for one typical indication.
+				    if ($c->{config} =~ /^Complexity Enabled\s+\(\)/smi) {
+					warn "ERROR: $dirname/$label: skipping invalid results\n";
+					next INSTANCE;
+				    }
+				}
+				elsif ($configSourceName eq "Microsoft_ActiveDirectory_FSMORoles") {
+				    # The LM PowerShell script sometimes fails without any explicit 
+				    # error, just bad data. Check for one or more invalid results.
+				    if ($c->{config} =~ /^(?:PDC Emulator|(?:Domain Naming|RID|Infrastructure) Master)\s*$/smi) {
+					warn "ERROR: $dirname/$label: skipping invalid results\n";
+					next INSTANCE;
+				    }
 				}
 
 				if ($c->{config} =~ /^\s*$/s and not $skip_empty_check) {
