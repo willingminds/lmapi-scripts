@@ -1,11 +1,11 @@
 package WM::LMAPI;
 
 #------------------------------------------------------------------------------
-# Copyright (c) 2018 by Willing Minds LLC
+# Copyright (c) 2018-2023 by Willing Minds LLC
 # All Rights Reserved.
 #
-# 1240 N. Van Buren Street #107
-# Anaheim, CA 92807
+# 9811 W. Charleston Blvd. Ste 2-779
+# Las Vegas NV 89117
 #
 # 714-630-4772 (voice)
 # 714-844-4698 (fax)
