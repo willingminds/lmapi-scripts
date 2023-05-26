@@ -270,6 +270,8 @@ sub _condbail {
     if ($self->{_last_request}) {
 	 $request_data = "\nraw request:\n" . $self->{_last_request}->as_string;
     }
+    $json->{status} ||= "UNKNOWN STATUS";
+    $json->{errmsg} ||= "UNKNOWN ERROR";
     croak "$self->{company}: get_all(@{[Data::Dumper->Dump([$args], [qw(args)])]}): $json->{status} $json->{errmsg}$request_data\n";
 }
 
@@ -341,6 +343,9 @@ sub _version {
 	}
 	elsif ($path =~ m{^/service/(services|groups)/\d+/properties$}) {
 	    $version = 1;
+	}
+	elsif ($path =~ m{^/device/devices/\d+/scheduleAutoDiscovery$}) {
+	    $version = 3;
 	}
 	elsif ($path =~ m{^/device/(devices|groups)/\d+/properties$}) {
 	    $version = 1;
@@ -712,6 +717,7 @@ sub lmapiauth {
     my $content = "";
 
     $content = $opts{'content'} if ($method eq "PUT" or $method eq "POST" or $method eq "PATCH");
+    $content ||= "";
     
     # construct authorization string
     my $epoch = int(time * 1000);	# time in ms

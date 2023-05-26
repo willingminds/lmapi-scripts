@@ -194,40 +194,55 @@ for my $device (@$devices) {
 		for my $instance (@$instances) {
 		    if (defined $instance->{id}) {
 			
-			# Try it without the 'fields' clause to see if it gets fewer timeouts
-			#my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1);
-			my $config = $lmapi->get_all(path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config", sort => '-version', size => 1, fields => "instanceName,config,pollTimestamp");
-			for my $c (@$config) {
-			    my $instancename = $c->{instanceName};
-			    my $label = "$devicename.$configSourceName.$instancename";
-			    
-			    # ignore this one if data is stale
-			    my $age = int((time - $c->{pollTimestamp}/1000)/60);
-			    if ($age > $STALEPOLLTIME) {
-			        verbose 1, "$label: skipping due to stale pollTimestamp (${age}m)\n";
-				next INSTANCE;
-			    }
-			    
-			    # check if any instances should be skipped
-			    if ($configSourceName eq "Cisco_WLC_DynamicConfigs") {
-				next INSTANCE if $instancename eq "run-config";
-			    }
+			my $config = $lmapi->get_all(
+			    path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config",
+			    sort => '-version', 
+			    size => 1, 
+			    fields => "instanceName,config,pollTimestamp"
+			);
+			if ($config) {
+			    for my $c (@$config) {
+				my $instancename = $c->{instanceName};
+				my $label = "$devicename.$configSourceName.$instancename";
+				
+				# ignore this one if data is stale
+				my $age = int((time - $c->{pollTimestamp}/1000)/60);
+				if ($age > $STALEPOLLTIME) {
+				    verbose 1, "$label: skipping due to stale pollTimestamp (${age}m)\n";
+				    next INSTANCE;
+				}
+				
+				# check if any instances should be skipped
+				if ($configSourceName eq "Cisco_WLC_DynamicConfigs") {
+				    next INSTANCE if $instancename eq "run-config";
+				}
 
-			    # preprocess labels that make for poor filenames
-			    $label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
-			    $label =~ s:\s:_:g;	# needed when LM decides to embed SPACES in instance names
+				# preprocess labels that make for poor filenames
+				$label =~ s:/:_:g;	# needed for filepath instances, like SFTP_Files
+				$label =~ s:\s:_:g;	# needed when LM decides to embed SPACES in instance names
 
-			    verbose 2, "label=$label\n";
-			    if ($label =~ /^[\w._-]+$/) {
+				verbose 2, "label=$label\n";
+				if ($label !~ /^[\w._()-]+$/) {
+				    warn "ERROR: $dirname/$label: invalid label format, skipping\n";
+				    next INSTANCE;
+				}
+				
 				# trim trailing whitespace from all lines
 				$c->{config} =~ s/\s*$//smg;
 
+				# check if network configs dropped to one line -- a big red flag!
+				if ($configSourceName =~ /^ssh_(?:exec|interactive)_/i) {
+				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
+				}
+				
 				# preprocess results since LM cannot seem to program properly
 				if ($configSourceName eq "Cisco_IOS") {
 				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
 				    # new idiocy introduced in Cisco_IOS 0.0.31
 				    $c->{config} =~ s/\ANo view is active ! Currently in Privilege Level Context\s*//smi;
+
+				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
 
 				    if ($c->{config} =~ /^line con ([1-9].*)/m) {
 					warn "ERROR: $dirname/$label: bogus 'line con $1' in config due to LM bugs, skipping\n";
@@ -257,6 +272,8 @@ for my $device (@$devices) {
 				    }
 				}
 				elsif ($configSourceName eq "Cisco_NXOS") {
+				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
+
 				    # Latest ConfigSource adds a timestamp to the config
 				    $c->{config} =~ s/^!Time:\s\w{3}\s\w{3}\s\d+\s\d{2}:\d{2}:\d{2}\s\d{4}\s*$//smig;
 				}
@@ -309,6 +326,8 @@ for my $device (@$devices) {
 				}
 				elsif ($configSourceName eq "HPE_Network_Config" or
 				       $configSourceName =~ /ssh_interactive_/i and $category{hpswitch}) {
+				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
+
 				    if ($c->{config} =~ /^invalid input:\s+/smig) {
 					warn "ERROR: $dirname/$label: $c->{config}\n";
 					next INSTANCE;
@@ -413,9 +432,6 @@ for my $device (@$devices) {
 				    warn "ERROR: open $dirname/$label: $!\n";
 				}
 			    }
-			    else {
-				warn "ERROR: $dirname/$label: invalid label format, skipping\n";
-			    }
 			}
 		    }
 		}
@@ -438,4 +454,16 @@ sub getprop {
     my $pval = (map { $_->{value} } grep { $_->{name} eq $name } @{$properties})[0];
 
     return $pval;
+}
+
+sub warn_one_line {
+    my $name = shift;
+    my $cfg = shift;
+    my $n = split(/\n/, $cfg);
+
+    if ($n == 1) {
+	warn "ERROR: $name only single line found:\n => $cfg\n";
+	return 1;
+    }
+    return 0;
 }
