@@ -22,3 +22,6 @@
 
 * lm-manage-interface-alerts
   * update network interface monitor and alert settings based on regex properties
+
+* lm-action
+  * run actions for one or more device -- currently supports scheduleAutoDiscovery
