@@ -1,0 +1,104 @@
+#! /usr/bin/perl
+
+# lm-action
+# 
+# This script uses the LogicMonitor REST API to trigger actions
+# such as "scheduleAutoDiscovery". Most or all of these use 
+# undocumented API, but have been found necessary to implement
+# due to shortcomings in LM.
+#
+#------------------------------------------------------------------------------
+# Copyright (c) 2023 by Willing Minds LLC
+# All Rights Reserved.
+#
+# 9811 W. Charleston Blvd. Ste 2-779
+# Las Vegas NV 89117
+#
+# 714-630-4772 (voice)
+# 714-860-4940 (fax)
+#
+# http://www.willingminds.com/
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#------------------------------------------------------------------------------
+
+use FindBin qw($Script $Bin);
+use JSON;
+use Getopt::Long;
+use Data::Dumper;
+
+use lib $Bin;
+use WM::LMAPI;
+
+use strict;
+use warnings;
+
+#------------------------------------------------------------------------------
+
+# option defaults
+my $VERBOSE = 0;
+my $COMPANY;
+my $ACTION;
+my @DEVICES;
+
+Getopt::Long::Configure ("bundling");
+
+GetOptions(
+    "dryrun|n"     => \$WM::LMAPI::DRYRUN,
+    "trace|t=i"    => \$WM::LMAPI::TRACE,
+    "verbose|v+"   => \$VERBOSE,
+    "company|c=s"  => \$COMPANY,
+    "device|D=s"   => \@DEVICES,
+    "action|A=s"   => \$ACTION,
+) or die;
+
+die "ERROR: must define company\n" if not defined($COMPANY);
+die "ERROR: must define at least one device\n" if not @DEVICES;
+die "ERROR: must define action\n" if not defined($ACTION);
+
+sub verbose ($@) {
+    my $minverbose = shift;
+    print join("", @_) if $VERBOSE >= $minverbose;
+}
+
+my $lmapi = WM::LMAPI->new(company => $COMPANY) or die;
+
+#------------------------------------------------------------------------------
+
+
+my $devices;
+eval {
+    $devices = $lmapi->get_all(path => "/device/devices", fields => "id,displayName");
+};
+if ($@) {
+    warn "$COMPANY: unable to load devices\n$@\n";
+    exit 1;
+}
+my %DEVICES = map { lc $_ => 1 } @DEVICES;
+
+DEVICE:
+for my $d (@{$devices}) {
+    if ($DEVICES{lc $d->{displayName}}) {
+	if ($ACTION eq "scheduleAutoDiscovery") { 
+	    verbose 1, "scheduling AD for $d->{displayName}\n";
+	    if (not $lmapi->post(path => "/device/devices/$d->{id}/scheduleAutoDiscovery")) {
+		warn "ERROR: $ACTION failed\n";
+	    }
+	}
+	else {
+	    die "ERROR: unsupported action: $ACTION\n";
+	}
+    }
+}
