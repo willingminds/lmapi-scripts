@@ -229,6 +229,10 @@ for my $device (@$devices) {
 
 				# trim trailing whitespace from all lines
 				$c->{config} =~ s/\s*$//smg;
+				
+				# trim leading and trailing blank lines
+				$c->{config} =~ s/\A\s*\n//smg;
+				$c->{config} =~ s/^\s*\n\Z//smg;
 
 				# check if network configs dropped to one line -- a big red flag!
 				if ($configSourceName !~ /^microsoft_/i) {
