@@ -247,8 +247,6 @@ for my $device (@$devices) {
 				    # strip ntp clock period (calculated repeatedly)
 				    $c->{config} =~ s/^ntp clock-period \d+\n//smi;
 
-				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
-
 				    if ($c->{config} =~ /^line con ([1-9].*)/m) {
 					warn "ERROR: $dirname/$label: bogus 'line con $1' in config due to LM bugs, skipping\n";
 					next INSTANCE;
@@ -312,8 +310,6 @@ for my $device (@$devices) {
 				}
 				elsif ($configSourceName eq "HPE_Network_Config" or
 				       $configSourceName =~ /ssh_interactive_/i and $category{hpswitch}) {
-				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
-
 				    if ($c->{config} =~ /^invalid input:\s+/smig) {
 					warn "ERROR: $dirname/$label: $c->{config}\n";
 					next INSTANCE;
