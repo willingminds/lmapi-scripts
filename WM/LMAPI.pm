@@ -436,19 +436,22 @@ sub _do_request {
 		    return { $status_field => $response->code, errmsg => $response->status_line };
 		}
 	    }
-	    elsif ($response->status_line =~ /^500\s/ and $response->header("Client-Warning") eq 'Internal response') {
-		# An error happened on this side of the connection such as an 
-		# alarm timer expiring or other handled signal.  Retry.
-		$retries++;
-		if ($retries > $max_retries) {
-		    carp $self->company, ": Request had LMAPI failure after $max_retries retries -- giving up.\n";
-		    return { $status_field => 500, errmsg => $response->status_line };
-		}
-		else {
-		    trace(7, "Internal error received: " . localtime . "\n");
-		    carp $self->company, ": Request had internal error -- attempting retry $retries\n";
-		    trace(3, "Response as-string:\n" . $response->as_string . "\n");
-		    next;
+	    elsif ($response->status_line =~ /^500\s/) {
+		my $client_warning = $response->header("Client-Warning");
+		if (defined $client_warning and $client_warning eq 'Internal response') {
+		    # An error happened on this side of the connection such as an 
+		    # alarm timer expiring or other handled signal.  Retry.
+		    $retries++;
+		    if ($retries > $max_retries) {
+			carp $self->company, ": Request had LMAPI failure after $max_retries retries -- giving up.\n";
+			return { $status_field => 500, errmsg => $response->status_line };
+		    }
+		    else {
+			trace(7, "Internal error received: " . localtime . "\n");
+			carp $self->company, ": Request had internal error -- attempting retry $retries\n";
+			trace(3, "Response as-string:\n" . $response->as_string . "\n");
+			next;
+		    }
 		}
 	    }
 	    else {

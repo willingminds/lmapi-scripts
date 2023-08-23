@@ -193,7 +193,7 @@ for my $device (@$devices) {
 		INSTANCE:
 		for my $instance (@$instances) {
 		    if (defined $instance->{id}) {
-			
+
 			my $config = $lmapi->get_all(
 			    path => "/device/devices/$device->{id}/devicedatasources/$devicedatasource->{id}/instances/$instance->{id}/config",
 			    sort => '-version', 
@@ -204,14 +204,14 @@ for my $device (@$devices) {
 			    for my $c (@$config) {
 				my $instancename = $c->{instanceName};
 				my $label = "$devicename.$configSourceName.$instancename";
-				
+
 				# ignore this one if data is stale
 				my $age = int((time - $c->{pollTimestamp}/1000)/60);
 				if ($age > $STALEPOLLTIME) {
 				    verbose 1, "$label: skipping due to stale pollTimestamp (${age}m)\n";
 				    next INSTANCE;
 				}
-				
+
 				# check if any instances should be skipped
 				if ($configSourceName eq "Cisco_WLC_DynamicConfigs") {
 				    next INSTANCE if $instancename eq "run-config";
@@ -226,21 +226,26 @@ for my $device (@$devices) {
 				    warn "ERROR: $dirname/$label: invalid label format, skipping\n";
 				    next INSTANCE;
 				}
-				
+
 				# trim trailing whitespace from all lines
 				$c->{config} =~ s/\s*$//smg;
 
 				# check if network configs dropped to one line -- a big red flag!
-				if ($configSourceName =~ /^ssh_(?:exec|interactive)_/i) {
+				if ($configSourceName !~ /^microsoft_/i) {
 				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
 				}
-				
+
 				# preprocess results since LM cannot seem to program properly
-				if ($configSourceName eq "Cisco_IOS") {
+				if ($configSourceName eq "Cisco_IOS" or
+				    $configSourceName =~ /^ssh_(?:exec|interactive)_/i and ($category{cisco})) {
 				    $c->{config} =~ s/\s*^Press RETURN to get started\.\Z//smi;
 				    $c->{config} =~ s/\s*^\S+ tty\d+ is now available\Z//smi;
+				    
 				    # new idiocy introduced in Cisco_IOS 0.0.31
 				    $c->{config} =~ s/\ANo view is active ! Currently in Privilege Level Context\s*//smi;
+
+				    # strip ntp clock period (calculated repeatedly)
+				    $c->{config} =~ s/^ntp clock-period \d+\n//smi;
 
 				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
 
@@ -253,27 +258,8 @@ for my $device (@$devices) {
 					warn "ERROR: $dirname/$label: uncaught AAA error, skipping\n";
 					next INSTANCE;
 				    }
-				    
-				    eval {
-					load "Cisco::Reconfig";
-				    };
-				    my $has_cisco_reconfig = not defined $@;
-				    ### DISABLED FOR NOW - Cisco::Reconfig failing on too many inputs
-				    if (0 and $has_cisco_reconfig and $sysinfo =~ /^Cisco IOS/ and $instancename =~ /-config$/) {
-					eval {
-					    if (my $parsed_config = Cisco::Reconfig::stringconfig($c->{config})) {
-						$parsed_config->set("line aux 0", "speed", undef);
-						$c->{config} = $parsed_config->alltext();
-					    }
-					};
-					if ($@) {
-					    warn "ERROR: unable to parse $label: $@\n";
-					}
-				    }
 				}
 				elsif ($configSourceName eq "Cisco_NXOS") {
-				    warn_one_line("$dirname/$label", $c->{config}) and next INSTANCE;
-
 				    # Latest ConfigSource adds a timestamp to the config
 				    $c->{config} =~ s/^!Time:\s\w{3}\s\w{3}\s\d+\s\d{2}:\d{2}:\d{2}\s\d{4}\s*$//smig;
 				}
